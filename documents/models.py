@@ -35,8 +35,8 @@ class Document(models.Model):
         validators=[FileExtensionValidator(allowed_extensions=['pdf', 'txt', 'docx'])]
     )
     # Defaults removed for Commit 3 to fix later
-    file_type = models.CharField(max_length=10, choices=FILE_TYPE_CHOICES)
-    file_size = models.PositiveIntegerField(help_text="File size in bytes")
+    file_type = models.CharField(max_length=10, choices=FILE_TYPE_CHOICES, blank=True, default='')
+    file_size = models.PositiveIntegerField(help_text="File size in bytes", default=0)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='uploaded')
     
     # Processing metadata
