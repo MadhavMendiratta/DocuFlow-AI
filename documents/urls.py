@@ -1,6 +1,12 @@
-from django.urls import path
+from django.urls import path, include
+from rest_framework.routers import DefaultRouter
 from django.shortcuts import redirect
 from . import views
+
+# API Router
+router = DefaultRouter()
+router.register(r'documents', views.DocumentViewSet, basename='document')
+router.register(r'processing-jobs', views.ProcessingJobViewSet, basename='processingjob')
 
 app_name = 'documents'
 
@@ -12,6 +18,9 @@ def redirect_to_login(request):
         return redirect('admin:login')
 
 urlpatterns = [
+    # API URLs
+    path('api/', include(router.urls)),
+    
     # Web Interface URLs
     path('', redirect_to_login, name='home'),
     path('dashboard/', views.dashboard, name='dashboard'),
