@@ -207,3 +207,61 @@ class DocumentStatsSerializer(serializers.Serializer):
     total_file_size = serializers.IntegerField()
     avg_processing_time = serializers.FloatField()
     recent_uploads = serializers.IntegerField()
+
+class DocumentUploadSerializer(serializers.Serializer):
+    """Serializer for document upload with processing options"""
+    
+    file = serializers.FileField()
+    title = serializers.CharField(max_length=255, required=False)
+    start_processing = serializers.BooleanField(default=True)
+    analysis_types = serializers.ListField(
+        child=serializers.ChoiceField(choices=[
+            'summary', 'key_points', 'sentiment', 'topics', 'entities'
+        ]),
+        required=False,
+        default=['summary', 'key_points', 'sentiment', 'topics']
+    )
+    
+    def validate_file(self, value):
+        """Validate uploaded file"""
+        if not value:
+            raise serializers.ValidationError("No file provided")
+        
+        # Check file size
+        if value.size > 10 * 1024 * 1024:  # 10MB
+            raise serializers.ValidationError("File size cannot exceed 10MB")
+        
+        # Check file extension
+        allowed_extensions = ['pdf', 'txt', 'docx']
+        file_extension = value.name.split('.')[-1].lower()
+        
+        if file_extension not in allowed_extensions:
+            raise serializers.ValidationError(
+                f"File type '{file_extension}' not supported. "
+                f"Allowed types: {', '.join(allowed_extensions)}"
+            )
+        
+        return value
+    
+    def create(self, validated_data):
+        """Create document and optionally start processing"""
+        from .tasks import process_document
+        
+        # Extract processing options
+        start_processing = validated_data.pop('start_processing', True)
+        analysis_types = validated_data.pop('analysis_types', [])
+        
+        # Set title from filename if not provided
+        if not validated_data.get('title'):
+            filename = validated_data['file'].name
+            validated_data['title'] = filename.rsplit('.', 1)[0]
+        
+        # Create document
+        validated_data['user'] = self.context['request'].user
+        document = Document.objects.create(**validated_data)
+        
+        # Start processing if requested
+        if start_processing:
+            process_document.delay(str(document.id))
+        
+        return document
