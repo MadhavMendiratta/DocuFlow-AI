@@ -37,7 +37,7 @@ THIRD_PARTY_APPS = [
 ]
 
 LOCAL_APPS = [
-    # 'documents', # Will be added in Commit 2
+    'documents',
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
