@@ -5,7 +5,7 @@ from django.db.models import Sum
 from django.core.paginator import Paginator
 
 from rest_framework import viewsets, status
-from rest_framework.decorators import action
+from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.permissions import IsAuthenticated
@@ -279,4 +279,48 @@ class ProcessingJobViewSet(viewsets.ReadOnlyModelViewSet):
             document__user=self.request.user
         ).order_by('-created_at')
     
+# --- API Helper Views ---
 
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def document_status(request, document_id):
+    """Get current document processing status"""
+    try:
+        document = Document.objects.get(id=document_id, user=request.user)
+        
+        status_data = {
+            'document_id': str(document.id),
+            'status': document.status,
+            'title': document.title,
+            'created_at': document.created_at,
+        }
+        
+        # Add processing job info if exists
+        try:
+            job = document.processing_job
+            status_data.update({
+                'job_status': job.status,
+                'progress': job.progress,
+                'started_at': job.started_at,
+                'completed_at': job.completed_at,
+                'error_message': job.error_message,
+            })
+        except ProcessingJob.DoesNotExist:
+            pass
+        
+        return Response(status_data)
+        
+    except Document.DoesNotExist:
+        return Response({
+            'error': 'Document not found'
+        }, status=status.HTTP_404_NOT_FOUND)
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def health_check(request):
+    """Health check endpoint"""
+    return Response({
+        'status': 'healthy',
+        'timestamp': timezone.now(),
+        'user': request.user.username,
+    })

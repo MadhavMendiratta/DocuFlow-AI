@@ -20,6 +20,8 @@ def redirect_to_login(request):
 urlpatterns = [
     # API URLs
     path('api/', include(router.urls)),
+    path('api/documents/<uuid:document_id>/status/', views.document_status, name='document_status_api'),
+    path('api/health/', views.health_check, name='health_check'),
     
     # Web Interface URLs
     path('', redirect_to_login, name='home'),
