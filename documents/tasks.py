@@ -10,7 +10,8 @@ from django.utils import timezone
 from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
 
-from .models import Document, ProcessingJob, ProcessingLog, DocumentAnalysis
+# Notice APILog is now imported here:
+from .models import Document, ProcessingJob, ProcessingLog, DocumentAnalysis, APILog
 
 logger = logging.getLogger(__name__)
 
@@ -351,6 +352,40 @@ def _gemini_generate(model, prompt, genai, *, max_retries: int = 3):
             else:
                 raise
 
+def log_api_call(
+    *,
+    analysis_type: str,
+    response,
+    elapsed: float,
+    success: bool = True,
+    error_message: str = '',
+    document: 'Document | None' = None,
+) -> 'APILog':
+    """Create an :model:`APILog` row from a Gemini response."""
+    counts = _extract_token_counts(response) if response else {
+        'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0,
+    }
+    cost = _estimate_cost(counts['input_tokens'], counts['output_tokens'])
+
+    log_entry = APILog.objects.create(
+        document=document,
+        analysis_type=analysis_type,
+        model_used=getattr(settings, 'GEMINI_MODEL', 'gemini-1.5-flash'),
+        input_tokens=counts['input_tokens'],
+        output_tokens=counts['output_tokens'],
+        total_tokens=counts['total_tokens'],
+        cost_estimated=cost,
+        response_time=round(elapsed, 3),
+        success=success,
+        error_message=error_message,
+    )
+    logger.debug(
+        f"APILog: {analysis_type} | "
+        f"in={counts['input_tokens']} out={counts['output_tokens']} "
+        f"cost=${cost}"
+    )
+    return log_entry
+
 def analyze_document_with_gemini(document: Document, text_content: str) -> dict:
     """Run all analysis types via Gemini AI and persist to DocumentAnalysis."""
     genai = _configure_genai()
@@ -401,11 +436,24 @@ def analyze_document_with_gemini(document: Document, text_content: str) -> dict:
 
             if not response.text:
                 logger.warning(f"{analysis_type}: empty Gemini response")
+                log_api_call(
+                    analysis_type=analysis_type, response=response,
+                    elapsed=elapsed, success=True,
+                    error_message='empty response',
+                    document=document,
+                )
                 continue
 
             result = response.text.strip()
             counts = _extract_token_counts(response)
             total_tokens += counts['total_tokens']
+
+            # Log the successful API call
+            log_api_call(
+                analysis_type=analysis_type, response=response,
+                elapsed=elapsed, success=True,
+                document=document,
+            )
 
             if analysis_type == 'summary':
                 analysis.summary = result
@@ -437,6 +485,12 @@ def analyze_document_with_gemini(document: Document, text_content: str) -> dict:
 
         except Exception as e:
             logger.error(f"Error in {analysis_type} analysis: {e}", exc_info=True)
+            log_api_call(
+                analysis_type=analysis_type, response=None,
+                elapsed=time.time() - start if 'start' in dir() else 0,
+                success=False, error_message=str(e),
+                document=document,
+            )
             continue
 
     analysis.total_processing_time = total_time
