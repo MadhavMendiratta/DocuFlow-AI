@@ -254,3 +254,58 @@ class ProcessingLog(models.Model):
     
     def __str__(self):
         return f"{self.level.upper()}: {self.message[:50]}..."
+
+class APILog(models.Model):
+    """Per-call log of Gemini API usage with token counts and estimated cost."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    # Link to a single document (Batch link will be added in Phase 7)
+    document = models.ForeignKey(
+        Document, on_delete=models.CASCADE,
+        related_name='api_logs', blank=True, null=True,
+    )
+
+    # What type of analysis prompt was this?
+    analysis_type = models.CharField(
+        max_length=50,
+        help_text='e.g. summary, key_points, sentiment, topics',
+    )
+    model_used = models.CharField(max_length=100, default='gemini-1.5-flash')
+
+    # Token counters
+    input_tokens = models.PositiveIntegerField(default=0)
+    output_tokens = models.PositiveIntegerField(default=0)
+    total_tokens = models.PositiveIntegerField(default=0)
+
+    # Cost
+    cost_estimated = models.DecimalField(
+        max_digits=10, decimal_places=6, default=0,
+        help_text='Estimated cost in USD for this single API call',
+    )
+
+    # Timing
+    response_time = models.FloatField(
+        blank=True, null=True,
+        help_text='Wall-clock time for the API call in seconds',
+    )
+    success = models.BooleanField(default=True)
+    error_message = models.TextField(blank=True, default='')
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = 'API Log'
+        verbose_name_plural = 'API Logs'
+        indexes = [
+            models.Index(fields=['document', '-created_at']),
+            models.Index(fields=['analysis_type']),
+        ]
+
+    def __str__(self):
+        target = self.document or 'unknown'
+        return (
+            f"{self.analysis_type} | {self.total_tokens} tokens | "
+            f"${self.cost_estimated} | {target}"
+        )
