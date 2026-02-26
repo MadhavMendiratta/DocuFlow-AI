@@ -11,6 +11,60 @@ def document_upload_path(instance, filename):
     filename = f"{uuid.uuid4()}.{ext}"
     return os.path.join('documents', str(instance.user.id), filename)
 
+class DocumentBatch(models.Model):
+    """Model for grouping multiple documents into a single analysis session"""
+
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('processing', 'Processing'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='batches')
+    title = models.CharField(max_length=255, blank=True, default='')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name_plural = 'Document batches'
+        indexes = [
+            models.Index(fields=['user', '-created_at']),
+            models.Index(fields=['status']),
+        ]
+
+    def __str__(self):
+        return f"Batch {self.id} ({self.get_status_display()})"
+
+    @property
+    def document_count(self):
+        return self.documents.count()
+
+    @property
+    def all_documents_completed(self):
+        """Check whether every document in the batch has finished processing."""
+        return (
+            self.documents.exists()
+            and not self.documents.exclude(status='completed').exists()
+        )
+
+    @property
+    def total_api_cost(self):
+        """Sum of estimated costs across every API call linked to this batch."""
+        from django.db.models import Sum
+        return self.api_logs.aggregate(total=Sum('cost_estimated'))['total'] or 0
+
+    @property
+    def total_tokens_used(self):
+        """Sum of tokens used across every API call linked to this batch."""
+        from django.db.models import Sum
+        return self.api_logs.aggregate(total=Sum('total_tokens'))['total'] or 0
+
+
 class Document(models.Model):
     """Model for uploaded documents"""
     
@@ -29,12 +83,19 @@ class Document(models.Model):
     
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='documents')
+    batch = models.ForeignKey(
+        DocumentBatch,
+        on_delete=models.CASCADE,
+        related_name='documents',
+        blank=True,
+        null=True,
+        help_text='The batch / analysis session this document belongs to',
+    )
     title = models.CharField(max_length=255)
     file = models.FileField(
         upload_to=document_upload_path,
         validators=[FileExtensionValidator(allowed_extensions=['pdf', 'txt', 'docx'])]
     )
-    # Defaults removed for Commit 3 to fix later
     file_type = models.CharField(max_length=10, choices=FILE_TYPE_CHOICES, blank=True, default='')
     file_size = models.PositiveIntegerField(help_text="File size in bytes", default=0)
     content_hash = models.CharField(
@@ -83,6 +144,7 @@ class Document(models.Model):
         
         super().save(*args, **kwargs)
 
+
 class ProcessingJob(models.Model):
     """Model to track document processing jobs"""
     
@@ -124,6 +186,7 @@ class ProcessingJob(models.Model):
     
     def __str__(self):
         return f"Processing Job for {self.document.title}"
+
 
 class DocumentAnalysis(models.Model):
     """Single analysis record per document with all analysis types"""
@@ -189,11 +252,47 @@ class DocumentAnalysis(models.Model):
         ])
         return (completed / 4) * 100
 
+
+class BatchAnalysis(models.Model):
+    """Cross-document analysis results for an entire batch"""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    batch = models.OneToOneField(
+        DocumentBatch,
+        on_delete=models.CASCADE,
+        related_name='analysis',
+    )
+    combined_summary = models.TextField(
+        blank=True, null=True,
+        help_text='AI-generated summary combining all documents in the batch',
+    )
+    key_insights = models.JSONField(
+        blank=True, null=True,
+        help_text='Key insights extracted across all documents',
+    )
+    contradictions = models.JSONField(
+        blank=True, null=True,
+        help_text='Contradictions or inconsistencies found across documents',
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name_plural = 'Batch analyses'
+
+    def __str__(self):
+        return f"Batch Analysis for {self.batch}"
+
+
 class DocumentTag(models.Model):
     """Model for document tags/categories"""
+    
     name = models.CharField(max_length=50, unique=True)
     color = models.CharField(max_length=7, default='#007bff', help_text="Hex color code")
     description = models.TextField(blank=True)
+    
     created_at = models.DateTimeField(auto_now_add=True)
     
     class Meta:
@@ -202,12 +301,15 @@ class DocumentTag(models.Model):
     def __str__(self):
         return self.name
 
+
 class DocumentTagging(models.Model):
     """Many-to-many relationship between documents and tags"""
+    
     document = models.ForeignKey(Document, on_delete=models.CASCADE)
     tag = models.ForeignKey(DocumentTag, on_delete=models.CASCADE)
     confidence = models.FloatField(default=1.0, help_text="Tag confidence (0-1)")
     auto_generated = models.BooleanField(default=False, help_text="Whether tag was auto-generated by AI")
+    
     created_at = models.DateTimeField(auto_now_add=True)
     
     class Meta:
@@ -219,6 +321,7 @@ class DocumentTagging(models.Model):
     
     def __str__(self):
         return f"{self.document.title} - {self.tag.name}"
+
 
 class ProcessingLog(models.Model):
     """Model to log processing steps and events"""
@@ -259,21 +362,27 @@ class ProcessingLog(models.Model):
     def __str__(self):
         return f"{self.level.upper()}: {self.message[:50]}..."
 
+
 class APILog(models.Model):
     """Per-call log of Gemini API usage with token counts and estimated cost."""
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
-    # Link to a single document (Batch link will be added in Phase 7)
+    # Link to either a single document, a batch, or both
     document = models.ForeignKey(
         Document, on_delete=models.CASCADE,
+        related_name='api_logs', blank=True, null=True,
+    )
+    batch = models.ForeignKey(
+        DocumentBatch, on_delete=models.CASCADE,
         related_name='api_logs', blank=True, null=True,
     )
 
     # What type of analysis prompt was this?
     analysis_type = models.CharField(
         max_length=50,
-        help_text='e.g. summary, key_points, sentiment, topics',
+        help_text='e.g. summary, key_points, sentiment, topics, '
+                  'combined_summary, common_themes, contradictions',
     )
     model_used = models.CharField(max_length=100, default='gemini-1.5-flash')
 
@@ -304,11 +413,12 @@ class APILog(models.Model):
         verbose_name_plural = 'API Logs'
         indexes = [
             models.Index(fields=['document', '-created_at']),
+            models.Index(fields=['batch', '-created_at']),
             models.Index(fields=['analysis_type']),
         ]
 
     def __str__(self):
-        target = self.document or 'unknown'
+        target = self.document or self.batch or 'unknown'
         return (
             f"{self.analysis_type} | {self.total_tokens} tokens | "
             f"${self.cost_estimated} | {target}"
