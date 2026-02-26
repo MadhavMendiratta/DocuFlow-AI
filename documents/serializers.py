@@ -1,8 +1,8 @@
 from rest_framework import serializers
 from django.contrib.auth.models import User
 from .models import (
-    Document, ProcessingJob, DocumentAnalysis, 
-    DocumentTag, ProcessingLog
+    Document, DocumentBatch, BatchAnalysis, ProcessingJob,
+    DocumentAnalysis, DocumentTag, ProcessingLog, APILog,
 )
 
 class DocumentSerializer(serializers.ModelSerializer):
@@ -265,3 +265,193 @@ class DocumentUploadSerializer(serializers.Serializer):
             process_document.delay(str(document.id))
         
         return document
+
+class BatchUploadSerializer(serializers.Serializer):
+    """Serializer for uploading multiple files as a single batch."""
+
+    ALLOWED_EXTENSIONS = {'pdf', 'txt', 'docx'}
+    MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB per file
+
+    files = serializers.ListField(
+        child=serializers.FileField(),
+        allow_empty=False,
+        help_text='One or more files (PDF, DOCX, TXT) to include in the batch.',
+    )
+    title = serializers.CharField(
+        max_length=255,
+        required=False,
+        default='',
+        help_text='Optional human-readable title for the batch.',
+    )
+
+    # ── Validation ───────────────────────────────────────────────────────
+
+    def validate_files(self, files):
+        """Validate every file in the upload list."""
+        if not files:
+            raise serializers.ValidationError('At least one file is required.')
+
+        errors = []
+        for f in files:
+            ext = f.name.rsplit('.', 1)[-1].lower() if '.' in f.name else ''
+            if ext not in self.ALLOWED_EXTENSIONS:
+                errors.append(
+                    f"'{f.name}': unsupported type '{ext}'. "
+                    f"Allowed: {', '.join(sorted(self.ALLOWED_EXTENSIONS))}"
+                )
+            if f.size > self.MAX_FILE_SIZE:
+                errors.append(
+                    f"'{f.name}': {f.size / (1024*1024):.1f} MB exceeds "
+                    f"the {self.MAX_FILE_SIZE / (1024*1024):.0f} MB limit."
+                )
+
+        if errors:
+            raise serializers.ValidationError(errors)
+
+        return files
+
+    # ── Creation ─────────────────────────────────────────────────────────
+
+    def create(self, validated_data):
+        """Create a DocumentBatch with one Document per uploaded file."""
+        from .tasks import process_batch
+
+        user = self.context['request'].user
+        files = validated_data['files']
+        batch_title = validated_data.get('title', '') or f'Batch — {len(files)} file(s)'
+
+        batch = DocumentBatch.objects.create(user=user, title=batch_title)
+
+        documents = []
+        for f in files:
+            title = f.name.rsplit('.', 1)[0]
+            doc = Document.objects.create(
+                user=user,
+                batch=batch,
+                title=title,
+                file=f,
+            )
+            documents.append(doc)
+
+        # Mark the batch as processing and fire the Celery task
+        batch.status = 'processing'
+        batch.save(update_fields=['status'])
+        
+        # We will add process_batch in Commit 26, but the call is prepped here!
+        try:
+            process_batch.delay(str(batch.id))
+        except NameError:
+            pass
+
+        return batch, documents
+
+
+class BatchDocumentStatusSerializer(serializers.ModelSerializer):
+    """Lightweight per-document status used inside batch status responses."""
+
+    class Meta:
+        model = Document
+        fields = [
+            'id', 'title', 'file_type', 'status',
+            'processing_error', 'created_at',
+        ]
+        read_only_fields = fields
+
+
+class BatchStatusSerializer(serializers.ModelSerializer):
+    """Full status view of a batch — progress, counts, per-doc breakdown."""
+
+    documents = BatchDocumentStatusSerializer(many=True, read_only=True)
+    total_documents = serializers.SerializerMethodField()
+    documents_processed = serializers.SerializerMethodField()
+    progress = serializers.SerializerMethodField()
+    failure_message = serializers.SerializerMethodField()
+    total_api_cost = serializers.SerializerMethodField()
+    total_tokens_used = serializers.SerializerMethodField()
+
+    class Meta:
+        model = DocumentBatch
+        fields = [
+            'id', 'title', 'status', 'progress',
+            'retry_count', 'max_retries',
+            'total_documents', 'documents_processed',
+            'failure_message',
+            'total_api_cost', 'total_tokens_used',
+            'created_at', 'updated_at',
+            'documents',
+        ]
+        read_only_fields = fields
+
+    # ── computed fields ──────────────────────────────────────────────────
+
+    def get_total_documents(self, obj):
+        return obj.documents.count()
+
+    def get_documents_processed(self, obj):
+        return obj.documents.filter(status='completed').count()
+
+    def get_progress(self, obj):
+        """Return an integer 0–100 representing batch-wide progress."""
+        total = obj.documents.count()
+        if total == 0:
+            return 0
+        completed = obj.documents.filter(status='completed').count()
+        return round((completed / total) * 100)
+
+    def get_failure_message(self, obj):
+        """Aggregate error messages from any failed documents."""
+        if obj.status != 'failed':
+            return None
+        errors = (
+            obj.documents
+            .filter(status='failed', processing_error__isnull=False)
+            .exclude(processing_error='')
+            .values_list('title', 'processing_error')
+        )
+        if not errors:
+            return 'Batch failed with no specific error messages.'
+        return [
+            {'document': title, 'error': err}
+            for title, err in errors
+        ]
+
+    def get_total_api_cost(self, obj):
+        return float(obj.total_api_cost)
+
+    def get_total_tokens_used(self, obj):
+        return obj.total_tokens_used
+
+
+class BatchResultSerializer(serializers.ModelSerializer):
+    """Serializer for cross-document analysis results (BatchAnalysis)."""
+
+    batch_id = serializers.UUIDField(source='batch.id', read_only=True)
+    batch_status = serializers.CharField(source='batch.status', read_only=True)
+    failure_message = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BatchAnalysis
+        fields = [
+            'id', 'batch_id', 'batch_status',
+            'combined_summary', 'key_insights', 'contradictions',
+            'failure_message',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = fields
+
+    def get_failure_message(self, obj):
+        batch = obj.batch
+        if batch.status != 'failed':
+            return None
+        errors = (
+            batch.documents
+            .filter(status='failed', processing_error__isnull=False)
+            .exclude(processing_error='')
+            .values_list('title', 'processing_error')
+        )
+        if not errors:
+            return 'Batch failed with no specific error messages.'
+        return [
+            {'document': title, 'error': err}
+            for title, err in errors
+        ]
