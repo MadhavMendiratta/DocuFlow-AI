@@ -37,6 +37,10 @@ class Document(models.Model):
     # Defaults removed for Commit 3 to fix later
     file_type = models.CharField(max_length=10, choices=FILE_TYPE_CHOICES, blank=True, default='')
     file_size = models.PositiveIntegerField(help_text="File size in bytes", default=0)
+    content_hash = models.CharField(
+        max_length=64, blank=True, default='', db_index=True,
+        help_text='SHA-256 hash of file content for deduplication',
+    )
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='uploaded')
     
     # Processing metadata
