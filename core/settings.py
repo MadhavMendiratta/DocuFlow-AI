@@ -76,6 +76,9 @@ TEMPLATES = [
 WSGI_APPLICATION = 'core.wsgi.application'
 ASGI_APPLICATION = 'core.asgi.application'
 
+# Redis Configuration
+REDIS_URL = config('REDIS_URL', default='redis://localhost:6379/0')
+
 # Channels Configuration
 CHANNEL_LAYERS = {
     'default': {
@@ -84,6 +87,21 @@ CHANNEL_LAYERS = {
             'hosts': [REDIS_URL],
         },
     },
+}
+# Cache Configuration
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+        'LOCATION': REDIS_URL,
+    }
+}
+
+# Document processing cache TTL (seconds) — default 7 days
+DOCUMENT_CACHE_TTL = config(
+    'DOCUMENT_CACHE_TTL',
+    default=60 * 60 * 24 * 7,
+    cast=int
+)
 
 # Database Configuration
 DATABASE_URL = config('DATABASE_URL', default='sqlite:///db.sqlite3', cast=str)
@@ -131,8 +149,7 @@ MEDIA_ROOT = BASE_DIR / 'media'
 # Default primary key field type
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-# Redis Configuration
-REDIS_URL = config('REDIS_URL', default='redis://localhost:6379/0')
+
 
 # Celery Configuration
 CELERY_BROKER_URL = config('CELERY_BROKER_URL', default=REDIS_URL)
