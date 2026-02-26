@@ -10,8 +10,13 @@ from django.utils import timezone
 from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
 
-# Notice APILog is now imported here:
 from .models import Document, ProcessingJob, ProcessingLog, DocumentAnalysis, APILog
+
+# Import the new cache utilities
+from .cache import (
+    compute_file_hash, get_cached_text, set_cached_text,
+    get_cached_analysis, set_cached_analysis, get_cached_result,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +118,28 @@ def process_document(self, document_id: str) -> Dict[str, Any]:
         'initialization', progress=10,
     )
 
+    # ── Compute content hash for deduplication cache ─────────────────
+    file_hash = ''
+    cache_hit = False
+    try:
+        file_hash = compute_file_hash(document.file)
+        if not document.content_hash:
+            document.content_hash = file_hash
+            document.save(update_fields=['content_hash'])
+        logger.info(f"Document {document_id}: content hash = {file_hash[:12]}…")
+    except Exception as exc:
+        logger.warning(f"Document {document_id}: hash computation failed — {exc}")
+
+    # ── Check full cache (text + analysis) ───────────────────────────
+    cached = get_cached_result(file_hash) if file_hash else None
+    if cached:
+        cache_hit = True
+        log_processing_step(
+            str(document_id), str(processing_job.id), 'info',
+            'Cache HIT — reusing previously computed results.',
+            'cache_hit', progress=80,
+        )
+
     try:
         # ── Step 1: Text Extraction ──────────────────────────────────────
         if self.request.id:
@@ -120,9 +147,20 @@ def process_document(self, document_id: str) -> Dict[str, Any]:
         processing_job.progress = 20
         processing_job.save(update_fields=['progress'])
 
-        extracted_text = extract_text_from_document(document)
-        if not extracted_text or not extracted_text.strip():
-            raise ValueError("No text could be extracted from the document")
+        if cache_hit:
+            extracted_text = cached['extracted_text']
+            log_processing_step(
+                str(document_id), str(processing_job.id), 'info',
+                f'Text loaded from cache — {len(extracted_text):,} characters.',
+                'text_extraction_cache', progress=50,
+            )
+        else:
+            extracted_text = extract_text_from_document(document)
+            if not extracted_text or not extracted_text.strip():
+                raise ValueError("No text could be extracted from the document")
+            # Store in Redis cache for future duplicates
+            if file_hash:
+                set_cached_text(file_hash, extracted_text)
 
         document.extracted_text = extracted_text
         document.save(update_fields=['extracted_text'])
@@ -131,27 +169,74 @@ def process_document(self, document_id: str) -> Dict[str, Any]:
         processing_job.progress = 50
         processing_job.save(update_fields=['text_extraction_completed', 'progress'])
 
-        log_processing_step(
-            str(document_id), str(processing_job.id), 'info',
-            f'Text extracted — {len(extracted_text):,} characters.',
-            'text_extraction', progress=50,
-        )
+        if not cache_hit:
+            log_processing_step(
+                str(document_id), str(processing_job.id), 'info',
+                f'Text extracted — {len(extracted_text):,} characters.',
+                'text_extraction', progress=50,
+            )
 
         # ── Step 2: AI Analysis ──────────────────────────────────────────
         if self.request.id:
             self.update_state(state='PROGRESS', meta={'progress': 60, 'step': 'ai_analysis'})
 
-        analysis_results = analyze_document_with_gemini(document, extracted_text)
+        if cache_hit:
+            # Re-hydrate the DocumentAnalysis row from cached data
+            cached_analysis = cached['analysis']
+            analysis, _ = DocumentAnalysis.objects.get_or_create(
+                document=document,
+                defaults={'model_used': cached_analysis.get('model_used', 'gemini-pro')},
+            )
+            for field in ('summary', 'key_points', 'sentiment', 'sentiment_score',
+                          'topics', 'total_tokens_used', 'total_processing_time'):
+                if field in cached_analysis:
+                    setattr(analysis, field, cached_analysis[field])
+            analysis.summary_completed = bool(cached_analysis.get('summary'))
+            analysis.key_points_completed = bool(cached_analysis.get('key_points'))
+            analysis.sentiment_completed = bool(cached_analysis.get('sentiment'))
+            analysis.topics_completed = bool(cached_analysis.get('topics'))
+            analysis.save()
+
+            analysis_results = {
+                'analysis_id': str(analysis.id),
+                'completion_percentage': analysis.completion_percentage,
+                'cache_hit': True,
+            }
+            log_processing_step(
+                str(document_id), str(processing_job.id), 'info',
+                'AI analysis loaded from cache.',
+                'ai_analysis_cache', progress=90,
+            )
+        else:
+            analysis_results = analyze_document_with_gemini(document, extracted_text)
+            # Store analysis in Redis cache for future duplicates
+            if file_hash:
+                try:
+                    analysis_obj = document.analysis
+                    analysis_data = {
+                        'model_used': analysis_obj.model_used,
+                        'summary': analysis_obj.summary,
+                        'key_points': analysis_obj.key_points,
+                        'sentiment': analysis_obj.sentiment,
+                        'sentiment_score': analysis_obj.sentiment_score,
+                        'topics': analysis_obj.topics,
+                        'total_tokens_used': analysis_obj.total_tokens_used,
+                        'total_processing_time': analysis_obj.total_processing_time,
+                    }
+                    set_cached_analysis(file_hash, analysis_data)
+                except DocumentAnalysis.DoesNotExist:
+                    pass
 
         processing_job.ai_analysis_completed = True
         processing_job.progress = 90
         processing_job.save(update_fields=['ai_analysis_completed', 'progress'])
 
-        log_processing_step(
-            str(document_id), str(processing_job.id), 'info',
-            'AI analysis completed.',
-            'ai_analysis', progress=90,
-        )
+        if not cache_hit:
+            log_processing_step(
+                str(document_id), str(processing_job.id), 'info',
+                'AI analysis completed.',
+                'ai_analysis', progress=90,
+            )
 
         # ── Step 3: Finalise ─────────────────────────────────────────────
         if self.request.id:
@@ -509,7 +594,7 @@ def _parse_json_list(text: str) -> list:
 
     if cleaned.startswith('```'):
         lines = cleaned.split('\n')
-        lines = [ln for ln in lines if not ln.strip().startswith('```')]
+        lines = [ln for lines in lines if not lines.strip().startswith('```')]
         cleaned = '\n'.join(lines).strip()
 
     try:
