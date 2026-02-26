@@ -10,12 +10,16 @@ from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.permissions import IsAuthenticated
 
-from .models import Document, ProcessingJob, DocumentAnalysis, ProcessingLog
+from .models import (
+    Document, DocumentBatch, BatchAnalysis, ProcessingJob, 
+    DocumentAnalysis, ProcessingLog
+)
 from .serializers import (
     DocumentSerializer, DocumentListSerializer,
     ProcessingJobSerializer, DocumentUploadSerializer,
     DocumentAnalysisSerializer, ProcessingLogSerializer,
-    DocumentStatsSerializer
+    DocumentStatsSerializer, BatchUploadSerializer, 
+    BatchStatusSerializer, BatchResultSerializer
 )
 
 logger = logging.getLogger(__name__)
@@ -324,3 +328,207 @@ def health_check(request):
         'timestamp': timezone.now(),
         'user': request.user.username,
     })
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def batch_upload(request):
+    """Upload multiple files in a single request and create a DocumentBatch."""
+    from django.http import QueryDict
+    
+    data = QueryDict(mutable=True)
+    for key in request.data:
+        if key != 'files':
+            data[key] = request.data[key]
+            
+    files = request.FILES.getlist('files')
+    if not files:
+        return Response(
+            {'files': ['No files were uploaded.']},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    data.setlist('files', files)
+
+    serializer = BatchUploadSerializer(data=data, context={'request': request})
+    if serializer.is_valid():
+        batch, documents = serializer.save()
+        return Response(
+            {
+                'message': 'Batch uploaded successfully.',
+                'batch_id': str(batch.id),
+                'batch_title': batch.title,
+                'files_uploaded': len(documents),
+                'documents': [
+                    {
+                        'id': str(doc.id),
+                        'title': doc.title,
+                        'file_type': doc.file_type,
+                        'file_size': doc.file_size,
+                    }
+                    for doc in documents
+                ],
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def batch_retry(request, batch_id):
+    """Retry a failed batch."""
+    try:
+        batch = DocumentBatch.objects.get(id=batch_id, user=request.user)
+    except DocumentBatch.DoesNotExist:
+        return Response(
+            {'error': 'Batch not found.'},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    if batch.status not in ('failed', 'completed'):
+        return Response(
+            {'error': f'Batch is currently "{batch.status}" and cannot be retried.'},
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    if batch.retry_count >= batch.max_retries:
+        return Response(
+            {
+                'error': 'Maximum retry limit reached.',
+                'retry_count': batch.retry_count,
+                'max_retries': batch.max_retries,
+            },
+            status=status.HTTP_429_TOO_MANY_REQUESTS,
+        )
+
+    # Reset batch
+    batch.status = 'pending'
+    batch.retry_count += 1
+    batch.save(update_fields=['status', 'retry_count', 'updated_at'])
+
+    # Reset only failed documents back to uploaded so they are reprocessed
+    failed_docs = batch.documents.filter(status='failed')
+    reset_count = failed_docs.update(status='uploaded', processing_error='')
+
+    # Re-trigger Celery task
+    task_id = None
+    try:
+        from .tasks import process_batch
+        task = process_batch.delay(str(batch.id))
+        task_id = task.id
+        logger.info(
+            f"Batch {batch_id} retry #{batch.retry_count} triggered — "
+            f"task {task.id}, {reset_count} doc(s) reset."
+        )
+    except ImportError:
+        pass
+
+    return Response({
+        'batch_id': str(batch.id),
+        'status': batch.status,
+        'retry_count': batch.retry_count,
+        'max_retries': batch.max_retries,
+        'documents_reset': reset_count,
+        'celery_task_id': task_id,
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def batch_cancel(request, batch_id):
+    """Cancel a batch that is pending or processing."""
+    try:
+        batch = DocumentBatch.objects.get(id=batch_id, user=request.user)
+    except DocumentBatch.DoesNotExist:
+        return Response(
+            {'error': 'Batch not found.'},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    if batch.status not in ('pending', 'processing'):
+        return Response(
+            {'error': f'Batch is "{batch.status}" and cannot be cancelled.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    # Revoke individual document Celery tasks
+    cancelled_docs = 0
+    for doc in batch.documents.exclude(status='completed'):
+        try:
+            job = doc.processing_job
+            if job.celery_task_id:
+                try:
+                    from celery import current_app
+                    current_app.control.revoke(job.celery_task_id, terminate=True)
+                except ImportError:
+                    pass
+            job.status = 'revoked'
+            job.save(update_fields=['status'])
+        except Exception:
+            pass  # No processing job yet – that's fine
+            
+        doc.status = 'failed'
+        doc.processing_error = 'Cancelled by user'
+        doc.save(update_fields=['status', 'processing_error'])
+        cancelled_docs += 1
+
+    batch.status = 'failed'
+    batch.save(update_fields=['status', 'updated_at'])
+
+    logger.info(f"Batch {batch_id} cancelled by user {request.user.id}")
+
+    return Response({
+        'message': 'Batch cancelled successfully.',
+        'batch_id': str(batch.id),
+        'documents_cancelled': cancelled_docs,
+    })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def batch_status(request, batch_id):
+    """Return current processing status for a batch."""
+    try:
+        batch = DocumentBatch.objects.prefetch_related('documents').get(
+            id=batch_id, user=request.user,
+        )
+    except DocumentBatch.DoesNotExist:
+        return Response(
+            {'error': 'Batch not found.'},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    serializer = BatchStatusSerializer(batch)
+    return Response(serializer.data)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def batch_result(request, batch_id):
+    """Return the cross-document analysis results for a batch."""
+    try:
+        batch = DocumentBatch.objects.get(id=batch_id, user=request.user)
+    except DocumentBatch.DoesNotExist:
+        return Response(
+            {'error': 'Batch not found.'},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    try:
+        analysis = batch.analysis  # BatchAnalysis (OneToOne)
+    except BatchAnalysis.DoesNotExist:
+        return Response({
+            'batch_id': str(batch.id),
+            'batch_status': batch.status,
+            'combined_summary': None,
+            'key_insights': None,
+            'contradictions': None,
+            'failure_message': (
+                'Analysis has not been generated yet.'
+                if batch.status != 'failed'
+                else 'Batch processing failed before analysis could run.'
+            ),
+        })
+
+    serializer = BatchResultSerializer(analysis)
+    return Response(serializer.data)

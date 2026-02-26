@@ -20,6 +20,11 @@ def redirect_to_login(request):
 urlpatterns = [
     # API URLs
     path('api/', include(router.urls)),
+    path('api/batch/upload/', views.batch_upload, name='batch_upload'),
+    path('api/batch/<uuid:batch_id>/status/', views.batch_status, name='batch_status'),
+    path('api/batch/<uuid:batch_id>/result/', views.batch_result, name='batch_result'),
+    path('api/batch/<uuid:batch_id>/retry/', views.batch_retry, name='batch_retry'),
+    path('api/batch/<uuid:batch_id>/cancel/', views.batch_cancel, name='batch_cancel'),
     path('api/documents/<uuid:document_id>/status/', views.document_status, name='document_status_api'),
     path('api/health/', views.health_check, name='health_check'),
     
