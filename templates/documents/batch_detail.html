@@ -1,0 +1,506 @@
+{% extends 'base.html' %}
+{% block title %}{{ batch.title|default:"Batch Detail" }} — AI Document Processor{% endblock %}
+
+{% block content %}
+<div class="px-4 sm:px-6 lg:px-8 py-6">
+
+    <!-- ── Header ────────────────────────────────────────────────────── -->
+    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-6">
+        <div class="min-w-0">
+            <a href="{% url 'documents:batch_list' %}"
+               class="inline-flex items-center text-sm text-gray-500 hover:text-gray-700 mb-2">
+                <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+                </svg>
+                Back to Batches
+            </a>
+            <h1 class="text-2xl font-bold text-gray-900 truncate">{{ batch.title|default:"Untitled Batch" }}</h1>
+        </div>
+        <div class="flex flex-wrap gap-2">
+            {% if batch.status == 'processing' or batch.status == 'pending' %}
+            <button id="cancel-btn" onclick="cancelBatch()"
+                    class="inline-flex items-center px-3.5 py-2 text-sm font-medium rounded-lg bg-red-500 text-white hover:bg-red-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm">
+                <svg class="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                </svg>
+                Cancel Batch
+            </button>
+            {% endif %}
+            {% if batch.status == 'failed' and batch.retry_count < batch.max_retries %}
+            <button id="retry-btn" onclick="retryBatch()"
+                    class="inline-flex items-center px-3.5 py-2 text-sm font-medium rounded-lg bg-yellow-500 text-white hover:bg-yellow-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm">
+                <svg class="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                          d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                </svg>
+                Retry Batch
+            </button>
+            {% endif %}
+            <a href="{% url 'documents:upload_document' %}"
+               class="inline-flex items-center px-3.5 py-2 text-sm font-medium rounded-lg border border-gray-300 text-gray-700 bg-white hover:bg-gray-50 transition-colors">
+                <svg class="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+                </svg>
+                New Batch
+            </a>
+        </div>
+    </div>
+
+    <!-- ── Info + Cost Cards ─────────────────────────────────────────── -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
+
+        <!-- Batch Info Card -->
+        <div class="bg-white rounded-xl border border-gray-200 shadow-sm p-5">
+            <h3 class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3">Batch Info</h3>
+            <dl class="space-y-3">
+                <div class="flex justify-between items-center">
+                    <dt class="text-sm text-gray-500">Status</dt>
+                    <dd>
+                        <span id="batch-status" class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold
+                            {% if batch.status == 'completed' %}bg-green-100 text-green-800
+                            {% elif batch.status == 'processing' %}bg-yellow-100 text-yellow-800
+                            {% elif batch.status == 'failed' %}bg-red-100 text-red-800
+                            {% else %}bg-blue-100 text-blue-800{% endif %}">
+                            {{ batch.get_status_display }}
+                        </span>
+                    </dd>
+                </div>
+                <div>
+                    <div class="flex justify-between text-xs text-gray-500 mb-1">
+                        <span>Progress</span>
+                        <span id="progress-label">{{ progress }}%</span>
+                    </div>
+                    <div class="w-full bg-gray-200 rounded-full h-2">
+                        <div id="progress-bar" class="h-2 rounded-full transition-all duration-700
+                            {% if batch.status == 'completed' %}bg-green-500
+                            {% elif batch.status == 'failed' %}bg-red-500
+                            {% else %}bg-primary-500{% endif %}"
+                            style="width:{{ progress }}%"></div>
+                    </div>
+                </div>
+                <div class="flex justify-between">
+                    <dt class="text-sm text-gray-500">Documents</dt>
+                    <dd class="text-sm font-medium text-gray-900">
+                        <span id="completed-count">{{ completed_docs }}</span> / {{ total_docs }}
+                    </dd>
+                </div>
+                <div class="flex justify-between">
+                    <dt class="text-sm text-gray-500">Retries</dt>
+                    <dd class="text-sm font-medium text-gray-900">{{ batch.retry_count }} / {{ batch.max_retries }}</dd>
+                </div>
+                <div class="flex justify-between">
+                    <dt class="text-sm text-gray-500">Created</dt>
+                    <dd class="text-sm text-gray-900">{{ batch.created_at|date:"M d, Y H:i" }}</dd>
+                </div>
+            </dl>
+        </div>
+
+        <!-- Cost Tracking Card -->
+        <div class="bg-white rounded-xl border border-gray-200 shadow-sm p-5">
+            <h3 class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3">Cost Tracking</h3>
+            <dl class="space-y-4">
+                <div>
+                    <dt class="text-sm text-gray-500 mb-1">Tokens Used</dt>
+                    <dd class="text-2xl font-bold text-gray-900">{{ batch.total_tokens_used|default:"0" }}</dd>
+                </div>
+                <div>
+                    <dt class="text-sm text-gray-500 mb-1">Estimated Cost</dt>
+                    <dd class="text-2xl font-bold text-emerald-600">${{ batch.total_api_cost|floatformat:4 }}</dd>
+                </div>
+            </dl>
+        </div>
+
+        <!-- Quick Actions Card -->
+        <div class="bg-white rounded-xl border border-gray-200 shadow-sm p-5">
+            <h3 class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3">Batch ID</h3>
+            <p class="text-xs text-gray-500 font-mono break-all mb-4">{{ batch.id }}</p>
+
+            {% if batch.status == 'failed' %}
+            <div class="rounded-lg bg-red-50 border border-red-200 p-3 text-sm text-red-800">
+                <p class="font-medium mb-0.5">Batch Failed</p>
+                <p class="text-xs text-red-600">Some documents could not be processed. Check individual document errors below.</p>
+                {% if batch.retry_count < batch.max_retries %}
+                <button onclick="retryBatch()" class="mt-2 text-xs font-medium text-red-700 hover:underline">
+                    Click to retry ({{ batch.retry_count }}/{{ batch.max_retries }} retries used)
+                </button>
+                {% else %}
+                <p class="mt-1 text-xs text-red-500 font-medium">Maximum retries reached.</p>
+                {% endif %}
+            </div>
+            {% elif batch.status == 'processing' %}
+            <div class="rounded-lg bg-yellow-50 border border-yellow-200 p-3 text-sm text-yellow-800">
+                <div class="flex items-center gap-2">
+                    <svg class="w-4 h-4 animate-spin flex-shrink-0" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                    </svg>
+                    <span class="font-medium">Processing in progress…</span>
+                </div>
+                <p class="text-xs text-yellow-600 mt-1">This page will update automatically.</p>
+            </div>
+            {% elif batch.status == 'completed' %}
+            <div class="rounded-lg bg-green-50 border border-green-200 p-3 text-sm text-green-800">
+                <p class="font-medium">All documents processed successfully!</p>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- ── Documents in Batch ────────────────────────────────────────── -->
+    <div class="bg-white rounded-xl border border-gray-200 shadow-sm mb-6">
+        <div class="px-6 py-4 border-b border-gray-100">
+            <h2 class="text-base font-semibold text-gray-900">Documents in Batch</h2>
+        </div>
+        {% if documents %}
+        <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+                <thead>
+                    <tr class="border-b border-gray-100 bg-gray-50/50">
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Document</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Type</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Size</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Status</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Error</th>
+                        <th class="px-6 py-3 text-right text-xs font-semibold text-gray-500 uppercase tracking-wider">Actions</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-gray-100">
+                    {% for doc in documents %}
+                    <tr class="hover:bg-gray-50/60 transition-colors">
+                        <td class="px-6 py-4 font-medium text-gray-900">
+                            <a href="{% url 'documents:document_detail' doc.id %}" class="hover:text-primary-600 transition-colors">
+                                {{ doc.title }}
+                            </a>
+                        </td>
+                        <td class="px-6 py-4">
+                            <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-700">
+                                {{ doc.file_type|upper }}
+                            </span>
+                        </td>
+                        <td class="px-6 py-4 text-gray-500">{{ doc.file_size|filesizeformat }}</td>
+                        <td class="px-6 py-4">
+                            <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold
+                                {% if doc.status == 'completed' %}bg-green-100 text-green-800
+                                {% elif doc.status == 'processing' %}bg-yellow-100 text-yellow-800
+                                {% elif doc.status == 'failed' %}bg-red-100 text-red-800
+                                {% else %}bg-blue-100 text-blue-800{% endif %}">
+                                {{ doc.get_status_display }}
+                            </span>
+                        </td>
+                        <td class="px-6 py-4 text-xs text-red-600 max-w-xs truncate">
+                            {{ doc.processing_error|default:"—" }}
+                        </td>
+                        <td class="px-6 py-4 text-right">
+                            <a href="{% url 'documents:document_detail' doc.id %}"
+                               class="text-primary-600 hover:text-primary-800 font-medium text-xs">View</a>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="px-6 py-12 text-center text-sm text-gray-400">No documents in this batch.</div>
+        {% endif %}
+    </div>
+
+    <!-- ── Cross-Document Analysis ───────────────────────────────────── -->
+    {% if analysis %}
+    <div class="bg-white rounded-xl border border-gray-200 shadow-sm mb-6">
+        <div class="px-6 py-4 border-b border-gray-100 flex items-center gap-2">
+            <svg class="w-5 h-5 text-primary-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                      d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"/>
+            </svg>
+            <h2 class="text-base font-semibold text-gray-900">Cross-Document Analysis</h2>
+        </div>
+        <div class="p-6 space-y-8">
+
+            <!-- Combined Summary -->
+            {% if analysis.combined_summary %}
+            <div>
+                <div class="flex items-center gap-2 mb-3">
+                    <div class="w-8 h-8 rounded-lg bg-primary-50 text-primary-600 flex items-center justify-center">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                        </svg>
+                    </div>
+                    <h3 class="text-sm font-semibold text-gray-900">Combined Summary</h3>
+                </div>
+                <p class="text-sm text-gray-700 leading-relaxed pl-10">{{ analysis.combined_summary }}</p>
+            </div>
+            {% endif %}
+
+            <!-- Key Insights -->
+            {% if analysis.key_insights %}
+            <div>
+                <div class="flex items-center gap-2 mb-3">
+                    <div class="w-8 h-8 rounded-lg bg-emerald-50 text-emerald-600 flex items-center justify-center">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M13 10V3L4 14h7v7l9-11h-7z"/>
+                        </svg>
+                    </div>
+                    <h3 class="text-sm font-semibold text-gray-900">Key Insights</h3>
+                </div>
+                <ul class="pl-10 space-y-2">
+                    {% for insight in analysis.key_insights %}
+                    <li class="flex items-start gap-2 text-sm text-gray-700">
+                        <svg class="w-4 h-4 mt-0.5 flex-shrink-0 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4"/>
+                        </svg>
+                        {% if insight.theme %}
+                            <span><strong>{{ insight.theme }}:</strong> {{ insight.description }}</span>
+                        {% elif insight.items %}
+                            <span>{{ insight }}</span>
+                        {% else %}
+                            {{ insight }}
+                        {% endif %}
+                    </li>
+                    {% endfor %}
+                </ul>
+            </div>
+            {% endif %}
+
+            <!-- Contradictions -->
+            {% if analysis.contradictions %}
+            <div>
+                <div class="flex items-center gap-2 mb-3">
+                    <div class="w-8 h-8 rounded-lg bg-amber-50 text-amber-600 flex items-center justify-center">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+                        </svg>
+                    </div>
+                    <h3 class="text-sm font-semibold text-gray-900">Contradictions &amp; Inconsistencies</h3>
+                </div>
+                <div class="pl-10 space-y-2">
+                    {% for item in analysis.contradictions %}
+                    <div class="rounded-lg bg-amber-50 border border-amber-200 px-4 py-3 text-sm text-amber-800">
+                        <svg class="w-4 h-4 inline-block mr-1 text-amber-500 -mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01"/>
+                        </svg>
+                        {% if item.topic %}
+                            <strong>{{ item.topic }}:</strong> {{ item.details }}
+                        {% else %}
+                            {{ item }}
+                        {% endif %}
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+            {% endif %}
+
+            <!-- Analysis Metadata -->
+            <div class="pt-4 border-t border-gray-100 flex flex-wrap gap-x-6 gap-y-1 text-xs text-gray-400">
+                <span>Generated: {{ analysis.created_at|date:"M d, Y H:i" }}</span>
+            </div>
+        </div>
+    </div>
+
+    {% elif batch.status == 'processing' %}
+    <!-- ── Skeleton Loading for Analysis ─────────────────────────────── -->
+    <div class="bg-white rounded-xl border border-gray-200 shadow-sm mb-6">
+        <div class="px-6 py-4 border-b border-gray-100 flex items-center gap-2">
+            <svg class="w-5 h-5 text-primary-500 animate-spin" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+            </svg>
+            <h2 class="text-base font-semibold text-gray-900">Cross-Document Analysis</h2>
+        </div>
+        <div class="p-6 space-y-6 animate-pulse">
+            <div>
+                <div class="h-4 w-40 bg-gray-200 rounded mb-3"></div>
+                <div class="space-y-2">
+                    <div class="h-3 bg-gray-200 rounded w-full"></div>
+                    <div class="h-3 bg-gray-200 rounded w-5/6"></div>
+                    <div class="h-3 bg-gray-200 rounded w-4/6"></div>
+                </div>
+            </div>
+            <div>
+                <div class="h-4 w-32 bg-gray-200 rounded mb-3"></div>
+                <div class="space-y-2">
+                    <div class="h-3 bg-gray-200 rounded w-3/4"></div>
+                    <div class="h-3 bg-gray-200 rounded w-2/3"></div>
+                    <div class="h-3 bg-gray-200 rounded w-4/5"></div>
+                </div>
+            </div>
+            <div>
+                <div class="h-4 w-44 bg-gray-200 rounded mb-3"></div>
+                <div class="h-16 bg-amber-50 rounded-lg border border-amber-100"></div>
+            </div>
+        </div>
+    </div>
+
+    {% elif batch.status == 'completed' and not analysis %}
+    <div class="bg-white rounded-xl border border-gray-200 shadow-sm mb-6">
+        <div class="px-6 py-4 border-b border-gray-100">
+            <h2 class="text-base font-semibold text-gray-900">Cross-Document Analysis</h2>
+        </div>
+        <div class="px-6 py-12 text-center">
+            <svg class="mx-auto h-10 w-10 text-yellow-400 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                      d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+            </svg>
+            <h3 class="text-sm font-semibold text-gray-900">No Analysis Available</h3>
+            <p class="mt-1 text-sm text-gray-500">Processing completed but no cross-document analysis was generated.</p>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- ── API Logs ──────────────────────────────────────────────────── -->
+    {% if api_logs %}
+    <div class="bg-white rounded-xl border border-gray-200 shadow-sm">
+        <div class="px-6 py-4 border-b border-gray-100">
+            <h2 class="text-base font-semibold text-gray-900">API Usage Log</h2>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+                <thead>
+                    <tr class="border-b border-gray-100 bg-gray-50/50">
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Time</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Type</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Input</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Output</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Total</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Cost</th>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Status</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-gray-100">
+                    {% for log in api_logs %}
+                    <tr class="hover:bg-gray-50/60 transition-colors">
+                        <td class="px-6 py-3 text-gray-500 text-xs whitespace-nowrap">{{ log.created_at|date:"M d H:i:s" }}</td>
+                        <td class="px-6 py-3">
+                            <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-violet-50 text-violet-700">
+                                {{ log.analysis_type }}
+                            </span>
+                        </td>
+                        <td class="px-6 py-3 text-gray-600 font-mono text-xs">{{ log.input_tokens }}</td>
+                        <td class="px-6 py-3 text-gray-600 font-mono text-xs">{{ log.output_tokens }}</td>
+                        <td class="px-6 py-3 text-gray-900 font-mono text-xs font-medium">{{ log.total_tokens }}</td>
+                        <td class="px-6 py-3 text-emerald-600 font-mono text-xs">${{ log.cost_estimated|floatformat:6 }}</td>
+                        <td class="px-6 py-3">
+                            {% if log.success %}
+                            <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-700">OK</span>
+                            {% else %}
+                            <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-700">Fail</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+    const BATCH_ID = '{{ batch.id }}';
+    const BATCH_STATUS = '{{ batch.status }}';
+    let pollTimer = null;
+
+    // Auto-poll for in-progress batches
+    if (BATCH_STATUS === 'processing' || BATCH_STATUS === 'pending') {
+        pollTimer = setInterval(pollBatchStatus, 4000);
+        pollBatchStatus(); // immediate first poll
+    }
+
+    async function pollBatchStatus() {
+        try {
+            const res = await fetch('/api/batch/' + BATCH_ID + '/status/', {
+                headers: { 'X-CSRFToken': getCookie('csrftoken') },
+            });
+            if (!res.ok) return;
+            const data = await res.json();
+
+            // Update progress
+            const pct = data.progress || 0;
+            const bar = document.getElementById('progress-bar');
+            const label = document.getElementById('progress-label');
+            const count = document.getElementById('completed-count');
+            if (bar)   bar.style.width = pct + '%';
+            if (label) label.textContent = pct + '%';
+            if (count) count.textContent = data.documents_processed || 0;
+
+            // Update status badge
+            const badge = document.getElementById('batch-status');
+            if (badge) {
+                const cls = statusClasses(data.status);
+                badge.className = 'inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold ' + cls;
+                badge.textContent = capitalize(data.status);
+            }
+
+            // If done, reload to show full analysis
+            if (data.status === 'completed' || data.status === 'failed') {
+                clearInterval(pollTimer);
+                showToast(
+                    data.status === 'completed' ? 'Batch processing completed!' : 'Batch processing failed.',
+                    data.status === 'completed' ? 'success' : 'error'
+                );
+                setTimeout(() => location.reload(), 1500);
+            }
+        } catch (err) {
+            console.error('Poll error:', err);
+        }
+    }
+
+    async function retryBatch() {
+        const btn = document.getElementById('retry-btn');
+        if (btn) { btn.disabled = true; btn.textContent = 'Retrying…'; }
+
+        try {
+            const res = await fetch('/api/batch/' + BATCH_ID + '/retry/', {
+                method: 'POST',
+                headers: {
+                    'X-CSRFToken': getCookie('csrftoken'),
+                    'Content-Type': 'application/json',
+                },
+            });
+            const data = await res.json();
+            if (res.ok) {
+                showToast('Retry started! Processing will begin shortly.', 'success');
+                setTimeout(() => location.reload(), 1000);
+            } else {
+                showToast(data.error || 'Retry failed.', 'error');
+                if (btn) { btn.disabled = false; btn.textContent = 'Retry Batch'; }
+            }
+        } catch {
+            showToast('Network error.', 'error');
+            if (btn) { btn.disabled = false; btn.textContent = 'Retry Batch'; }
+        }
+    }
+
+    async function cancelBatch() {
+        if (!confirm('Cancel this batch? Non-completed documents will be marked as failed.')) return;
+        const btn = document.getElementById('cancel-btn');
+        if (btn) { btn.disabled = true; btn.textContent = 'Cancelling…'; }
+
+        try {
+            const res = await fetch('/api/batch/' + BATCH_ID + '/cancel/', {
+                method: 'POST',
+                headers: {
+                    'X-CSRFToken': getCookie('csrftoken'),
+                    'Content-Type': 'application/json',
+                },
+            });
+            const data = await res.json();
+            if (res.ok) {
+                showToast('Batch cancelled.', 'success');
+                clearInterval(pollTimer);
+                setTimeout(() => location.reload(), 1000);
+            } else {
+                showToast(data.error || 'Cancel failed.', 'error');
+                if (btn) { btn.disabled = false; btn.textContent = 'Cancel Batch'; }
+            }
+        } catch {
+            showToast('Network error.', 'error');
+            if (btn) { btn.disabled = false; btn.textContent = 'Cancel Batch'; }
+        }
+    }
+</script>
+{% endblock %}

@@ -1,28 +1,32 @@
 import logging
 from datetime import timedelta
 from django.utils import timezone
-from django.db.models import Sum
+from django.db.models import Count, Sum, Avg, Q
+from django.contrib.auth.decorators import login_required
+from django.shortcuts import render, get_object_or_404, redirect
+from django.http import JsonResponse, HttpResponse
+from django.urls import reverse
+from django.views.decorators.http import require_http_methods
 from django.core.paginator import Paginator
+from django.contrib import messages
 
-from rest_framework import viewsets, status
+from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.permissions import IsAuthenticated
 
-from .models import (
-    Document, DocumentBatch, BatchAnalysis, ProcessingJob, 
-    DocumentAnalysis, ProcessingLog
-)
+from .models import Document, DocumentBatch, BatchAnalysis, ProcessingJob, DocumentAnalysis, ProcessingLog, APILog
 from .serializers import (
-    DocumentSerializer, DocumentListSerializer,
+    DocumentSerializer, DocumentListSerializer, DocumentAnalysisSerializer,
     ProcessingJobSerializer, DocumentUploadSerializer,
-    DocumentAnalysisSerializer, ProcessingLogSerializer,
-    DocumentStatsSerializer, BatchUploadSerializer, 
-    BatchStatusSerializer, BatchResultSerializer
+    DocumentStatsSerializer, ProcessingLogSerializer,
+    BatchUploadSerializer, BatchStatusSerializer, BatchResultSerializer,
 )
+from .tasks import process_document, process_batch
 
 logger = logging.getLogger(__name__)
+
 
 class DocumentViewSet(viewsets.ModelViewSet):
     """ViewSet for Document CRUD operations"""
@@ -63,11 +67,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
         document = serializer.save(user=self.request.user)
         
         # Start processing automatically
-        try:
-            from .tasks import process_document
-            process_document.delay(str(document.id))
-        except ImportError:
-            pass
+        process_document.delay(str(document.id))
         
         logger.info(f"Document {document.id} created and processing started by user {self.request.user.id}")
     
@@ -112,11 +112,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
             pass
         
         # Start processing
-        try:
-            from .tasks import process_document
-            process_document.delay(str(document.id))
-        except ImportError:
-            pass
+        process_document.delay(str(document.id))
         
         logger.info(f"Document {document.id} reprocessing started by user {request.user.id}")
         
@@ -138,11 +134,8 @@ class DocumentViewSet(viewsets.ModelViewSet):
                 }, status=status.HTTP_400_BAD_REQUEST)
             
             # Cancel Celery task
-            try:
-                from celery import current_app
-                current_app.control.revoke(processing_job.celery_task_id, terminate=True)
-            except ImportError:
-                pass
+            from celery import current_app
+            current_app.control.revoke(processing_job.celery_task_id, terminate=True)
             
             # Update status
             processing_job.status = 'revoked'
@@ -282,8 +275,228 @@ class ProcessingJobViewSet(viewsets.ReadOnlyModelViewSet):
         return ProcessingJob.objects.filter(
             document__user=self.request.user
         ).order_by('-created_at')
+
+
+# Web Interface Views (HTML Templates)
+
+@login_required
+def dashboard(request):
+    """Main dashboard view"""
+    user_documents = Document.objects.filter(user=request.user)
+    user_batches = DocumentBatch.objects.filter(user=request.user).prefetch_related('documents')
+
+    # Get recent documents
+    recent_documents = user_documents.select_related('batch').order_by('-created_at')[:5]
+
+    # Get statistics
+    stats = {
+        'total_documents': user_documents.count(),
+        'processing_documents': user_documents.filter(status='processing').count(),
+        'completed_documents': user_documents.filter(status='completed').count(),
+        'failed_documents': user_documents.filter(status='failed').count(),
+    }
+
+    # Recent batches with progress computation
+    recent_batches_qs = user_batches.order_by('-created_at')[:5]
+    recent_batches = []
+    for batch in recent_batches_qs:
+        total = batch.documents.count()
+        completed = batch.documents.filter(status='completed').count()
+        progress = round((completed / total) * 100) if total > 0 else 0
+        recent_batches.append({
+            'batch': batch,
+            'total_docs': total,
+            'completed_docs': completed,
+            'progress': progress,
+            'cost': float(batch.total_api_cost),
+        })
+
+    # Cost tracking aggregates
+    cost_data = APILog.objects.filter(
+        Q(document__user=request.user) | Q(batch__user=request.user)
+    ).aggregate(
+        total_tokens=Sum('total_tokens'),
+        total_cost=Sum('cost_estimated'),
+    )
+
+    context = {
+        'recent_documents': recent_documents,
+        'recent_batches': recent_batches,
+        'stats': stats,
+        'total_tokens': cost_data['total_tokens'] or 0,
+        'total_cost': cost_data['total_cost'] or 0,
+    }
+
+    return render(request, 'documents/dashboard.html', context)
+
+
+@login_required
+def document_list(request):
+    """Document list view with filtering and pagination"""
+    documents = Document.objects.filter(user=request.user).select_related('batch')
     
-# --- API Helper Views ---
+    # Apply filters
+    status_filter = request.GET.get('status')
+    if status_filter:
+        documents = documents.filter(status=status_filter)
+    
+    file_type_filter = request.GET.get('file_type')
+    if file_type_filter:
+        documents = documents.filter(file_type=file_type_filter)
+    
+    search_query = request.GET.get('search')
+    if search_query:
+        documents = documents.filter(title__icontains=search_query)
+    
+    documents = documents.order_by('-created_at')
+    
+    # Pagination
+    paginator = Paginator(documents, 10)
+    page_number = request.GET.get('page')
+    page_obj = paginator.get_page(page_number)
+    
+    context = {
+        'page_obj': page_obj,
+        'status_filter': status_filter,
+        'file_type_filter': file_type_filter,
+        'search_query': search_query,
+    }
+    
+    return render(request, 'documents/document_list.html', context)
+
+
+@login_required
+def document_detail(request, document_id):
+    """Document detail view"""
+    document = get_object_or_404(Document, id=document_id, user=request.user)
+    
+    # Get analysis results
+    try:
+        analysis = document.analysis
+    except DocumentAnalysis.DoesNotExist:
+        analysis = None
+    
+    # Get processing logs
+    processing_logs = document.processing_logs.order_by('-created_at')[:20]
+    
+    context = {
+        'document': document,
+        'analysis': analysis,
+        'processing_logs': processing_logs,
+    }
+    
+    return render(request, 'documents/document_detail.html', context)
+
+
+@login_required
+def batch_list(request):
+    """Paginated list of all batches for the current user."""
+    batches_qs = (
+        DocumentBatch.objects
+        .filter(user=request.user)
+        .prefetch_related('documents')
+        .order_by('-created_at')
+    )
+
+    # Build enriched list with progress / cost
+    enriched = []
+    for batch in batches_qs:
+        total = batch.documents.count()
+        completed = batch.documents.filter(status='completed').count()
+        progress = round((completed / total) * 100) if total > 0 else 0
+        enriched.append({
+            'batch': batch,
+            'total_docs': total,
+            'completed_docs': completed,
+            'progress': progress,
+            'cost': float(batch.total_api_cost),
+            'tokens': batch.total_tokens_used,
+        })
+
+    paginator = Paginator(enriched, 10)
+    page_obj = paginator.get_page(request.GET.get('page'))
+
+    return render(request, 'documents/batch_list.html', {'page_obj': page_obj})
+
+
+@login_required
+def batch_detail_view(request, batch_id):
+    """Batch detail web view with analysis results + cost tracking."""
+    batch = get_object_or_404(DocumentBatch, id=batch_id, user=request.user)
+    documents = batch.documents.order_by('-created_at')
+
+    try:
+        analysis = batch.analysis
+    except BatchAnalysis.DoesNotExist:
+        analysis = None
+
+    api_logs = batch.api_logs.order_by('-created_at')[:20]
+
+    total_docs = documents.count()
+    completed_docs = documents.filter(status='completed').count()
+    progress = round((completed_docs / total_docs) * 100) if total_docs > 0 else 0
+
+    context = {
+        'batch': batch,
+        'documents': documents,
+        'analysis': analysis,
+        'api_logs': api_logs,
+        'progress': progress,
+        'total_docs': total_docs,
+        'completed_docs': completed_docs,
+    }
+    return render(request, 'documents/batch_detail.html', context)
+
+
+@login_required
+def upload_document(request):
+    """Document upload view — supports both standard form POST and AJAX."""
+    if request.method == 'POST':
+        uploaded_file = request.FILES.get('file')
+        title = request.POST.get('title', '')
+        is_ajax = request.headers.get('X-Requested-With') == 'XMLHttpRequest'
+
+        if not uploaded_file:
+            if is_ajax:
+                return JsonResponse(
+                    {'status': 'error', 'message': 'Please select a file to upload.'},
+                    status=400,
+                )
+            messages.error(request, 'Please select a file to upload.')
+            return render(request, 'documents/upload.html')
+
+        if not title:
+            title = uploaded_file.name.rsplit('.', 1)[0]
+
+        document = Document.objects.create(
+            user=request.user,
+            title=title,
+            file=uploaded_file,
+        )
+
+        # Trigger Celery processing
+        process_document.delay(str(document.id))
+
+        if is_ajax:
+            return JsonResponse({
+                'status': 'success',
+                'document_id': str(document.id),
+                'redirect_url': reverse(
+                    'documents:document_detail', args=[document.id],
+                ),
+                'message': f'Document "{title}" uploaded successfully.',
+            })
+
+        messages.success(
+            request,
+            f'Document "{title}" uploaded successfully and processing started.',
+        )
+        return redirect('documents:document_detail', document_id=document.id)
+
+    return render(request, 'documents/upload.html')
+
+
+# API Helper Views
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -319,27 +532,31 @@ def document_status(request, document_id):
             'error': 'Document not found'
         }, status=status.HTTP_404_NOT_FOUND)
 
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def health_check(request):
-    """Health check endpoint"""
-    return Response({
-        'status': 'healthy',
-        'timestamp': timezone.now(),
-        'user': request.user.username,
-    })
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def batch_upload(request):
-    """Upload multiple files in a single request and create a DocumentBatch."""
+    """Upload multiple files in a single request and create a DocumentBatch.
+
+    POST /api/batch/upload/
+    Content-Type: multipart/form-data
+
+    Fields:
+        files   – one or more files (PDF, DOCX, TXT)   [required]
+        title   – optional batch title                  [optional]
+
+    Returns 201 with batch_id and file count.
+    """
+    # DRF's ListField expects the key "files", but multipart uploads send
+    # each file under the same key.  We normalise here so the serializer
+    # receives a proper list.
+    # NOTE: We avoid request.data.copy() because deep-copying file handles
+    # (BufferedRandom) raises TypeError on Python 3.14+.
     from django.http import QueryDict
-    
     data = QueryDict(mutable=True)
     for key in request.data:
         if key != 'files':
             data[key] = request.data[key]
-            
     files = request.FILES.getlist('files')
     if not files:
         return Response(
@@ -376,7 +593,13 @@ def batch_upload(request):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def batch_retry(request, batch_id):
-    """Retry a failed batch."""
+    """Retry a failed batch.
+
+    POST /api/batch/<uuid>/retry/
+
+    Resets batch and its failed documents back to pending, increments
+    retry_count, and re-triggers the Celery process_batch task.
+    """
     try:
         batch = DocumentBatch.objects.get(id=batch_id, user=request.user)
     except DocumentBatch.DoesNotExist:
@@ -411,17 +634,12 @@ def batch_retry(request, batch_id):
     reset_count = failed_docs.update(status='uploaded', processing_error='')
 
     # Re-trigger Celery task
-    task_id = None
-    try:
-        from .tasks import process_batch
-        task = process_batch.delay(str(batch.id))
-        task_id = task.id
-        logger.info(
-            f"Batch {batch_id} retry #{batch.retry_count} triggered — "
-            f"task {task.id}, {reset_count} doc(s) reset."
-        )
-    except ImportError:
-        pass
+    task = process_batch.delay(str(batch.id))
+
+    logger.info(
+        f"Batch {batch_id} retry #{batch.retry_count} triggered — "
+        f"task {task.id}, {reset_count} doc(s) reset."
+    )
 
     return Response({
         'batch_id': str(batch.id),
@@ -429,14 +647,20 @@ def batch_retry(request, batch_id):
         'retry_count': batch.retry_count,
         'max_retries': batch.max_retries,
         'documents_reset': reset_count,
-        'celery_task_id': task_id,
+        'celery_task_id': task.id,
     })
 
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def batch_cancel(request, batch_id):
-    """Cancel a batch that is pending or processing."""
+    """Cancel a batch that is pending or processing.
+
+    POST /api/batch/<uuid>/cancel/
+
+    Revokes the Celery task (if any), marks the batch as failed, and
+    marks all non-completed documents as failed with a cancellation note.
+    """
     try:
         batch = DocumentBatch.objects.get(id=batch_id, user=request.user)
     except DocumentBatch.DoesNotExist:
@@ -452,21 +676,17 @@ def batch_cancel(request, batch_id):
         )
 
     # Revoke individual document Celery tasks
+    from celery import current_app
     cancelled_docs = 0
     for doc in batch.documents.exclude(status='completed'):
         try:
             job = doc.processing_job
             if job.celery_task_id:
-                try:
-                    from celery import current_app
-                    current_app.control.revoke(job.celery_task_id, terminate=True)
-                except ImportError:
-                    pass
+                current_app.control.revoke(job.celery_task_id, terminate=True)
             job.status = 'revoked'
             job.save(update_fields=['status'])
         except Exception:
             pass  # No processing job yet – that's fine
-            
         doc.status = 'failed'
         doc.processing_error = 'Cancelled by user'
         doc.save(update_fields=['status', 'processing_error'])
@@ -487,7 +707,18 @@ def batch_cancel(request, batch_id):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def batch_status(request, batch_id):
-    """Return current processing status for a batch."""
+    """Return current processing status for a batch.
+
+    GET /api/batch/<uuid>/status/
+
+    Response includes:
+        - status (pending / processing / completed / failed)
+        - progress  (0–100 %)
+        - documents_processed / total_documents
+        - per-document breakdown
+        - failure_message (if applicable)
+        - total_api_cost / total_tokens_used
+    """
     try:
         batch = DocumentBatch.objects.prefetch_related('documents').get(
             id=batch_id, user=request.user,
@@ -505,7 +736,16 @@ def batch_status(request, batch_id):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def batch_result(request, batch_id):
-    """Return the cross-document analysis results for a batch."""
+    """Return the cross-document analysis results for a batch.
+
+    GET /api/batch/<uuid>/result/
+
+    Response includes:
+        - combined_summary
+        - key_insights
+        - contradictions
+        - failure_message (if the batch failed)
+    """
     try:
         batch = DocumentBatch.objects.get(id=batch_id, user=request.user)
     except DocumentBatch.DoesNotExist:
@@ -517,6 +757,7 @@ def batch_result(request, batch_id):
     try:
         analysis = batch.analysis  # BatchAnalysis (OneToOne)
     except BatchAnalysis.DoesNotExist:
+        # Batch exists but cross-document analysis hasn’t run yet
         return Response({
             'batch_id': str(batch.id),
             'batch_status': batch.status,
@@ -532,3 +773,14 @@ def batch_result(request, batch_id):
 
     serializer = BatchResultSerializer(analysis)
     return Response(serializer.data)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def health_check(request):
+    """Health check endpoint"""
+    return Response({
+        'status': 'healthy',
+        'timestamp': timezone.now(),
+        'user': request.user.username,
+    })
