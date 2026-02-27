@@ -17,6 +17,7 @@ DEBUG = config('DEBUG', default=True, cast=bool)
 # Allowed Hosts Configuration
 ALLOWED_HOSTS = ['localhost', '127.0.0.1', 'testserver']
 
+# Allow custom domains from environment
 custom_hosts = config('ALLOWED_HOSTS', default='', cast=str).split(',')
 if custom_hosts and custom_hosts[0]:
     ALLOWED_HOSTS.extend([host.strip() for host in custom_hosts if host.strip()])
@@ -76,8 +77,32 @@ TEMPLATES = [
 WSGI_APPLICATION = 'core.wsgi.application'
 ASGI_APPLICATION = 'core.asgi.application'
 
+# Database Configuration
+DATABASE_URL = config('DATABASE_URL', default='sqlite:///db.sqlite3', cast=str)
+DATABASES = {
+    'default': dj_database_url.parse(DATABASE_URL, conn_max_age=600)
+}
+
+# For development, fallback to SQLite if PostgreSQL is not available
+if 'sqlite' not in DATABASE_URL:
+    DATABASES['default'].update({
+        'ENGINE': 'django.db.backends.postgresql',
+        'CONN_MAX_AGE': 60,
+    })
+
 # Redis Configuration
 REDIS_URL = config('REDIS_URL', default='redis://localhost:6379/0')
+
+# Celery Configuration
+CELERY_BROKER_URL = config('CELERY_BROKER_URL', default=REDIS_URL)
+CELERY_RESULT_BACKEND = config('CELERY_RESULT_BACKEND', default=REDIS_URL)
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TIMEZONE = 'UTC'
+CELERY_TASK_TRACK_STARTED = True
+CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes
+CELERY_TASK_SOFT_TIME_LIMIT = 25 * 60  # 25 minutes
 
 # Channels Configuration
 CHANNEL_LAYERS = {
@@ -88,6 +113,7 @@ CHANNEL_LAYERS = {
         },
     },
 }
+
 # Cache Configuration
 CACHES = {
     'default': {
@@ -97,23 +123,7 @@ CACHES = {
 }
 
 # Document processing cache TTL (seconds) — default 7 days
-DOCUMENT_CACHE_TTL = config(
-    'DOCUMENT_CACHE_TTL',
-    default=60 * 60 * 24 * 7,
-    cast=int
-)
-
-# Database Configuration
-DATABASE_URL = config('DATABASE_URL', default='sqlite:///db.sqlite3', cast=str)
-DATABASES = {
-    'default': dj_database_url.parse(DATABASE_URL, conn_max_age=600)
-}
-
-if 'sqlite' not in DATABASE_URL:
-    DATABASES['default'].update({
-        'ENGINE': 'django.db.backends.postgresql',
-        'CONN_MAX_AGE': 60,
-    })
+DOCUMENT_CACHE_TTL = config('DOCUMENT_CACHE_TTL', default=60 * 60 * 24 * 7, cast=int)
 
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
@@ -146,21 +156,9 @@ STATICFILES_DIRS = [BASE_DIR / 'static']
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
-# Default primary key field type
-DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
-
-
-
-# Celery Configuration
-CELERY_BROKER_URL = config('CELERY_BROKER_URL', default=REDIS_URL)
-CELERY_RESULT_BACKEND = config('CELERY_RESULT_BACKEND', default=REDIS_URL)
-CELERY_ACCEPT_CONTENT = ['json']
-CELERY_TASK_SERIALIZER = 'json'
-CELERY_RESULT_SERIALIZER = 'json'
-CELERY_TIMEZONE = 'UTC'
-CELERY_TASK_TRACK_STARTED = True
-CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes
-CELERY_TASK_SOFT_TIME_LIMIT = 25 * 60  # 25 minutes
+# File Upload Settings
+MAX_UPLOAD_SIZE = config('MAX_UPLOAD_SIZE', default=10485760, cast=int)  # 10MB
+ALLOWED_FILE_TYPES = config('ALLOWED_FILE_TYPES', default='pdf,txt,docx', cast=str).split(',')
 
 # Gemini AI Configuration
 GEMINI_API_KEY = config('GEMINI_API_KEY', default='')
@@ -168,7 +166,7 @@ GEMINI_MODEL = config('GEMINI_MODEL', default='gemini-1.5-flash')
 GEMINI_MAX_TOKENS = config('GEMINI_MAX_TOKENS', default=1000, cast=int)
 GEMINI_TEMPERATURE = config('GEMINI_TEMPERATURE', default=0.7, cast=float)
 
-# Gemini cost per token (USD). Override via env for newer pricing.
+# Gemini cost per token (USD).  Override via env for newer pricing.
 # Defaults are for gemini-1.5-flash as of Feb 2026.
 GEMINI_COST_PER_INPUT_TOKEN = config(
     'GEMINI_COST_PER_INPUT_TOKEN', default=0.000000075, cast=float,
@@ -208,3 +206,65 @@ CSRF_TRUSTED_ORIGINS = [
     "http://localhost:8000",
     "http://127.0.0.1:8000",
 ]
+
+# Security Settings
+if not DEBUG:
+    SECURE_SSL_REDIRECT = config('SECURE_SSL_REDIRECT', default=False, cast=bool)
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+
+# Logging Configuration
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'verbose': {
+            'format': '{levelname} {asctime} {module} {process:d} {thread:d} {message}',
+            'style': '{',
+        },
+        'simple': {
+            'format': '{levelname} {message}',
+            'style': '{',
+        },
+    },
+    'handlers': {
+        'file': {
+            'level': 'INFO',
+            'class': 'logging.FileHandler',
+            'filename': BASE_DIR / 'logs' / 'django.log',
+            'formatter': 'verbose',
+        },
+        'console': {
+            'level': 'DEBUG',
+            'class': 'logging.StreamHandler',
+            'formatter': 'simple',
+        },
+    },
+    'root': {
+        'handlers': ['console'],
+        'level': 'INFO',
+    },
+    'loggers': {
+        'django': {
+            'handlers': ['file', 'console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        'documents': {
+            'handlers': ['file', 'console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'celery': {
+            'handlers': ['file', 'console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+    },
+}
+
+# Create logs directory if it doesn't exist
+os.makedirs(BASE_DIR / 'logs', exist_ok=True)
+
+# Default primary key field type
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
