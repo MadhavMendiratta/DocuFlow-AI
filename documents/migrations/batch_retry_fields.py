@@ -4,8 +4,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        # Updated to point to the Commit 22 migration where DocumentBatch was created
-        ('documents', '0006_documentbatch_batchanalysis_document_batch'),
+        ('documents', '0005_apilog'),
     ]
 
     operations = [

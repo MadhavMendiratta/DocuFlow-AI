@@ -8,7 +8,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('documents', '0004_document_content_hash'),
+        ('documents', '0002_alter_document_file_size_alter_document_file_type'),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
@@ -56,10 +56,5 @@ class Migration(migrations.Migration):
         migrations.AddIndex(
             model_name='documentbatch',
             index=models.Index(fields=['status'], name='documents_d_status_05fad4_idx'),
-        ),
-        migrations.AddField(
-            model_name='apilog',
-            name='batch',
-            field=models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.CASCADE, related_name='api_logs', to='documents.documentbatch'),
         ),
     ]
