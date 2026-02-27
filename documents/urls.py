@@ -1,6 +1,5 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from django.shortcuts import redirect
 from . import views
 
 # API Router
@@ -9,6 +8,8 @@ router.register(r'documents', views.DocumentViewSet, basename='document')
 router.register(r'processing-jobs', views.ProcessingJobViewSet, basename='processingjob')
 
 app_name = 'documents'
+
+from django.shortcuts import redirect
 
 def redirect_to_login(request):
     """Redirect unauthenticated users to admin login"""
@@ -33,5 +34,7 @@ urlpatterns = [
     path('dashboard/', views.dashboard, name='dashboard'),
     path('documents/', views.document_list, name='document_list'),
     path('documents/<uuid:document_id>/', views.document_detail, name='document_detail'),
+    path('batches/', views.batch_list, name='batch_list'),
+    path('batches/<uuid:batch_id>/', views.batch_detail_view, name='batch_detail'),
     path('upload/', views.upload_document, name='upload_document'),
 ]

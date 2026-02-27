@@ -3,6 +3,7 @@ import uuid
 from django.db import models
 from django.contrib.auth.models import User
 from django.core.validators import FileExtensionValidator
+from django.conf import settings
 from django.urls import reverse
 
 def document_upload_path(instance, filename):
@@ -25,7 +26,6 @@ class DocumentBatch(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='batches')
     title = models.CharField(max_length=255, blank=True, default='')
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
-
     retry_count = models.PositiveIntegerField(default=0)
     max_retries = models.PositiveIntegerField(default=3)
 

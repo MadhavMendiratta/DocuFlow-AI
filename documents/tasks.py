@@ -1,18 +1,26 @@
+"""
+Celery tasks for document processing pipeline.
+
+Pipeline: Upload → Extract Text → AI Analysis → Store Results → Notify via WebSocket
+"""
+
 import json
 import time
 import uuid
 import logging
-from typing import Dict, Any
 from datetime import timedelta
+from typing import Dict, Any
+
 from celery import shared_task
 from django.conf import settings
 from django.utils import timezone
 from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
 
-from .models import Document, ProcessingJob, ProcessingLog, DocumentAnalysis, APILog, DocumentBatch, BatchAnalysis
-
-# Import the new cache utilities
+from .models import (
+    Document, DocumentBatch, BatchAnalysis,
+    ProcessingJob, DocumentAnalysis, ProcessingLog, APILog,
+)
 from .cache import (
     compute_file_hash, get_cached_text, set_cached_text,
     get_cached_analysis, set_cached_analysis, get_cached_result,
@@ -22,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 # ── WebSocket Helpers ────────────────────────────────────────────────────────
+
 
 def send_websocket_update(document_id: str, event_type: str, data: Dict[str, Any]):
     """Send real-time update to clients watching this document."""
@@ -71,6 +80,7 @@ def log_processing_step(
 
 
 # ── Main Processing Task ────────────────────────────────────────────────────
+
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=60)
 def process_document(self, document_id: str) -> Dict[str, Any]:
@@ -231,12 +241,11 @@ def process_document(self, document_id: str) -> Dict[str, Any]:
         processing_job.progress = 90
         processing_job.save(update_fields=['ai_analysis_completed', 'progress'])
 
-        if not cache_hit:
-            log_processing_step(
-                str(document_id), str(processing_job.id), 'info',
-                'AI analysis completed.',
-                'ai_analysis', progress=90,
-            )
+        log_processing_step(
+            str(document_id), str(processing_job.id), 'info',
+            'AI analysis completed.',
+            'ai_analysis', progress=90,
+        )
 
         # ── Step 3: Finalise ─────────────────────────────────────────────
         if self.request.id:
@@ -274,6 +283,7 @@ def process_document(self, document_id: str) -> Dict[str, Any]:
     except Exception as exc:
         logger.error(f"Error processing document {document_id}: {exc}", exc_info=True)
 
+        # Decide: retry or fail permanently
         will_retry = self.request.retries < self.max_retries
 
         try:
@@ -311,6 +321,7 @@ def process_document(self, document_id: str) -> Dict[str, Any]:
 
 # ── Text Extraction ──────────────────────────────────────────────────────────
 
+
 def extract_text_from_document(document: Document) -> str:
     """Route to the correct extractor based on file type."""
     file_path = document.file.path
@@ -328,10 +339,12 @@ def extract_text_from_document(document: Document) -> str:
 
     return extractor(file_path)
 
+
 def extract_text_from_pdf(file_path: str) -> str:
     """Extract text from PDF using pdfplumber with PyPDF2 fallback."""
     try:
         import pdfplumber
+
         text_parts = []
         with pdfplumber.open(file_path) as pdf:
             for i, page in enumerate(pdf.pages, 1):
@@ -341,12 +354,15 @@ def extract_text_from_pdf(file_path: str) -> str:
                         text_parts.append(f"--- Page {i} ---\n{page_text}")
                 except Exception as e:
                     logger.warning(f"pdfplumber: page {i} error: {e}")
+
         if text_parts:
             return '\n\n'.join(text_parts)
     except Exception as e:
         logger.warning(f"pdfplumber failed, falling back to PyPDF2: {e}")
 
+    # Fallback to PyPDF2
     import PyPDF2
+
     text_parts = []
     with open(file_path, 'rb') as f:
         reader = PyPDF2.PdfReader(f)
@@ -360,6 +376,7 @@ def extract_text_from_pdf(file_path: str) -> str:
 
     return '\n\n'.join(text_parts)
 
+
 def extract_text_from_txt(file_path: str) -> str:
     """Extract text from a plain-text file (tries multiple encodings)."""
     for encoding in ('utf-8', 'latin-1', 'cp1252'):
@@ -370,9 +387,11 @@ def extract_text_from_txt(file_path: str) -> str:
             continue
     raise ValueError("Could not decode text file with any known encoding")
 
+
 def extract_text_from_docx(file_path: str) -> str:
     """Extract text from a .docx file."""
     from docx import Document as DocxDocument
+
     doc = DocxDocument(file_path)
     return '\n'.join(p.text for p in doc.paragraphs if p.text.strip())
 
@@ -381,9 +400,11 @@ def extract_text_from_docx(file_path: str) -> str:
 
 MAX_PROMPT_CHARS = 4000
 
+
 def _configure_genai():
     """Lazily configure and return the google.generativeai module."""
     import google.generativeai as genai
+
     if settings.GEMINI_API_KEY:
         genai.configure(api_key=settings.GEMINI_API_KEY)
     return genai
@@ -397,11 +418,13 @@ def _extract_token_counts(response) -> Dict[str, int]:
             counts['input_tokens'] = getattr(meta, 'prompt_token_count', 0) or 0
             counts['output_tokens'] = getattr(meta, 'candidates_token_count', 0) or 0
             counts['total_tokens'] = getattr(meta, 'total_token_count', 0) or 0
+            # Fallback if total missing
             if not counts['total_tokens']:
                 counts['total_tokens'] = counts['input_tokens'] + counts['output_tokens']
     except Exception:
         pass
     return counts
+
 
 def _estimate_cost(input_tokens: int, output_tokens: int) -> float:
     """Estimate USD cost based on per-token pricing from settings."""
@@ -409,11 +432,20 @@ def _estimate_cost(input_tokens: int, output_tokens: int) -> float:
     cost_out = output_tokens * getattr(settings, 'GEMINI_COST_PER_OUTPUT_TOKEN', 0.0000003)
     return round(cost_in + cost_out, 6)
 
+
+# Delay between successive Gemini calls.  The free tier allows only
+# 5 requests per minute so we need ≥12 s between calls.
 GEMINI_CALL_DELAY = getattr(settings, 'GEMINI_CALL_DELAY', 13)
 
+
 def _gemini_generate(model, prompt, genai, *, max_retries: int = 3):
-    """Call model.generate_content with automatic retry on 429 rate-limit."""
+    """Call model.generate_content with automatic retry on 429 rate-limit.
+
+    Parses the ``retry_delay`` from the error when available, otherwise
+    uses exponential backoff (15 s, 30 s, 60 s).
+    """
     import re as _re
+
     for attempt in range(1, max_retries + 1):
         try:
             response = model.generate_content(
@@ -427,6 +459,7 @@ def _gemini_generate(model, prompt, genai, *, max_retries: int = 3):
         except Exception as exc:
             err_str = str(exc)
             if '429' in err_str and attempt < max_retries:
+                # Try to parse suggested wait time
                 match = _re.search(r'retry in ([\d.]+)s', err_str, _re.IGNORECASE)
                 wait = float(match.group(1)) + 2 if match else 15 * (2 ** (attempt - 1))
                 logger.warning(
@@ -437,6 +470,7 @@ def _gemini_generate(model, prompt, genai, *, max_retries: int = 3):
             else:
                 raise
 
+
 def log_api_call(
     *,
     analysis_type: str,
@@ -445,7 +479,7 @@ def log_api_call(
     success: bool = True,
     error_message: str = '',
     document: 'Document | None' = None,
-    batch: 'DocumentBatch | None' = None, # <-- Added this line
+    batch: 'DocumentBatch | None' = None,
 ) -> 'APILog':
     """Create an :model:`APILog` row from a Gemini response."""
     counts = _extract_token_counts(response) if response else {
@@ -455,7 +489,7 @@ def log_api_call(
 
     log_entry = APILog.objects.create(
         document=document,
-        batch=batch, # <-- Added this line
+        batch=batch,
         analysis_type=analysis_type,
         model_used=getattr(settings, 'GEMINI_MODEL', 'gemini-1.5-flash'),
         input_tokens=counts['input_tokens'],
@@ -528,26 +562,33 @@ def analyze_document_with_gemini(document: Document, text_content: str) -> dict:
                     elapsed=elapsed, success=True,
                     error_message='empty response',
                     document=document,
+                    batch=getattr(document, 'batch', None),
                 )
                 continue
 
             result = response.text.strip()
+
+            # Token tracking
             counts = _extract_token_counts(response)
             total_tokens += counts['total_tokens']
 
-            # Log the successful API call
+            # Log the API call
             log_api_call(
                 analysis_type=analysis_type, response=response,
                 elapsed=elapsed, success=True,
                 document=document,
+                batch=getattr(document, 'batch', None),
             )
 
+            # Persist result
             if analysis_type == 'summary':
                 analysis.summary = result
                 analysis.summary_completed = True
+
             elif analysis_type == 'key_points':
                 analysis.key_points = _parse_json_list(result)
                 analysis.key_points_completed = True
+
             elif analysis_type == 'sentiment':
                 sentiment = result.lower().strip().rstrip('.')
                 if sentiment in ('positive', 'negative', 'neutral'):
@@ -563,11 +604,14 @@ def analyze_document_with_gemini(document: Document, text_content: str) -> dict:
                     analysis.sentiment = 'neutral'
                     analysis.sentiment_score = 0.5
                 analysis.sentiment_completed = True
+
             elif analysis_type == 'topics':
                 analysis.topics = _parse_json_list(result)
                 analysis.topics_completed = True
 
             logger.info(f"{analysis_type} completed in {elapsed:.2f}s")
+
+            # Respect Gemini free-tier rate limits (5 req/min)
             time.sleep(GEMINI_CALL_DELAY)
 
         except Exception as e:
@@ -577,6 +621,7 @@ def analyze_document_with_gemini(document: Document, text_content: str) -> dict:
                 elapsed=time.time() - start if 'start' in dir() else 0,
                 success=False, error_message=str(e),
                 document=document,
+                batch=getattr(document, 'batch', None),
             )
             continue
 
@@ -590,13 +635,15 @@ def analyze_document_with_gemini(document: Document, text_content: str) -> dict:
         'total_processing_time': total_time,
     }
 
+
 def _parse_json_list(text: str) -> list:
     """Parse text as a JSON list with robust fallbacks."""
     cleaned = text.strip()
 
+    # Strip markdown code fences
     if cleaned.startswith('```'):
         lines = cleaned.split('\n')
-        lines = [ln for lines in lines if not lines.strip().startswith('```')]
+        lines = [ln for ln in lines if not ln.strip().startswith('```')]
         cleaned = '\n'.join(lines).strip()
 
     try:
@@ -606,6 +653,7 @@ def _parse_json_list(text: str) -> list:
     except (json.JSONDecodeError, ValueError):
         pass
 
+    # Fallback: split by lines and strip list markers
     items = []
     for line in text.split('\n'):
         line = line.strip()
@@ -623,13 +671,84 @@ def _parse_json_list(text: str) -> list:
             items.append(line)
     return items
 
+
+# ── Periodic / Maintenance Tasks ─────────────────────────────────────────────
+
+
+@shared_task
+def cleanup_failed_jobs():
+    """Remove failed processing jobs older than 24 hours."""
+    cutoff = timezone.now() - timedelta(hours=24)
+    count, _ = ProcessingJob.objects.filter(
+        status='failure', created_at__lt=cutoff,
+    ).delete()
+    logger.info(f"Cleaned up {count} failed processing jobs")
+    return f"Cleaned up {count} failed jobs"
+
+
+@shared_task
+def cleanup_old_logs():
+    """Remove processing logs older than 7 days."""
+    cutoff = timezone.now() - timedelta(days=7)
+    count, _ = ProcessingLog.objects.filter(created_at__lt=cutoff).delete()
+    logger.info(f"Cleaned up {count} old processing logs")
+    return f"Cleaned up {count} old logs"
+
+
+@shared_task
+def retry_failed_documents():
+    """Retry recently-failed documents (excludes user-cancelled)."""
+    cutoff = timezone.now() - timedelta(hours=1)
+    recent_failures = (
+        Document.objects
+        .filter(status='failed', processing_started_at__gte=cutoff)
+        .exclude(processing_error__icontains='cancelled')
+        .select_related('processing_job')
+    )
+
+    retried = 0
+    for doc in recent_failures:
+        try:
+            job = getattr(doc, 'processing_job', None)
+            if job and job.retry_count < 3:
+                doc.status = 'uploaded'
+                doc.processing_error = None
+                doc.save(update_fields=['status', 'processing_error'])
+
+                job.retry_count += 1
+                job.status = 'retry'
+                job.save(update_fields=['retry_count', 'status'])
+
+                process_document.delay(str(doc.id))
+                retried += 1
+                logger.info(f"Retrying document {doc.id}")
+        except Exception as e:
+            logger.error(f"Error retrying document {doc.id}: {e}")
+
+    logger.info(f"Retried {retried} documents")
+    return f"Retried {retried} documents"
+
+
 # ── Batch Processing Task ───────────────────────────────────────────────────
+
 
 MAX_BATCH_PROMPT_CHARS = 12000  # budget shared across all docs in a batch
 
+
 @shared_task(bind=True, max_retries=2, default_retry_delay=120)
 def process_batch(self, batch_id: str) -> Dict[str, Any]:
-    """Process every document in a batch through the full pipeline."""
+    """Process every document in a batch through the full pipeline:
+
+    1. Extract text from **each** document (reuses the single-doc pipeline).
+    2. Combine all extracted texts.
+    3. Run cross-document Gemini analysis (summary, themes, insights,
+       contradictions) and persist to :model:`BatchAnalysis`.
+    4. Update batch status throughout.
+
+    Retries up to *max_retries* on transient failures.
+    """
+
+    # ── 0. Load batch ────────────────────────────────────────────────────
     try:
         batch = DocumentBatch.objects.get(id=batch_id)
     except DocumentBatch.DoesNotExist:
@@ -642,24 +761,32 @@ def process_batch(self, batch_id: str) -> Dict[str, Any]:
         batch.save(update_fields=['status'])
         return {'status': 'error', 'message': 'Batch contains no documents'}
 
-    docs_to_process = [d for d in documents if d.status != 'completed']
-    
+    # On a retry only reprocess documents that are not already completed.
+    docs_to_process = [
+        d for d in documents
+        if d.status != 'completed'
+    ]
     logger.info(
-        f"Starting batch {batch_id} — {len(docs_to_process)}/{len(documents)} "
+        f"Batch {batch_id} — {len(docs_to_process)}/{len(documents)} "
         f"document(s) to process (retry #{batch.retry_count})."
+    )
+
+    logger.info(
+        f"Starting batch {batch_id} — {len(documents)} document(s)"
     )
     batch.status = 'processing'
     batch.save(update_fields=['status'])
 
-    # 1. Per-document text extraction & individual AI analysis
-    doc_results = []
-    extracted_texts = {}
+    # ── 1. Per-document text extraction & individual AI analysis ─────────
+    doc_results = []          # per-doc status payloads
+    extracted_texts = {}      # {doc_id: text}
 
     for idx, doc in enumerate(docs_to_process, 1):
         try:
             result = process_document(str(doc.id))
             doc_results.append({'document_id': str(doc.id), **result})
 
+            # Reload to pick up extracted_text saved by process_document
             doc.refresh_from_db()
             if doc.extracted_text:
                 extracted_texts[str(doc.id)] = doc.extracted_text
@@ -679,7 +806,7 @@ def process_batch(self, batch_id: str) -> Dict[str, Any]:
                 'message': str(exc),
             })
 
-    # 2. Cross-document Gemini analysis
+    # ── 2. Cross-document Gemini analysis ────────────────────────────────
     batch_analysis_result = {}
     if extracted_texts:
         try:
@@ -692,11 +819,15 @@ def process_batch(self, batch_id: str) -> Dict[str, Any]:
                 f"Batch {batch_id}: cross-document analysis failed — {exc}",
                 exc_info=True,
             )
+            # Non-fatal — individual doc results are still valid.
             batch_analysis_result = {'error': str(exc)}
     else:
-        logger.warning(f"Batch {batch_id}: no text was extracted from any document — skipping cross-document analysis.")
+        logger.warning(
+            f"Batch {batch_id}: no text was extracted from any document — "
+            f"skipping cross-document analysis."
+        )
 
-    # 3. Finalise batch status
+    # ── 3. Finalise batch status ─────────────────────────────────────────
     batch.refresh_from_db()
     if batch.all_documents_completed:
         batch.status = 'completed'
@@ -717,8 +848,14 @@ def process_batch(self, batch_id: str) -> Dict[str, Any]:
 
 # ── Cross-Document / Batch AI Analysis ───────────────────────────────────────
 
+
 def _build_combined_text(documents, extracted_texts: Dict[str, str]) -> str:
-    """Merge per-document texts into a single labelled block."""
+    """Merge per-document texts into a single labelled block.
+
+    Each document's content is prefixed with its title so the LLM can
+    distinguish sources.  The combined output is truncated to
+    ``MAX_BATCH_PROMPT_CHARS`` to stay within token limits.
+    """
     parts = []
     for doc in documents:
         text = extracted_texts.get(str(doc.id), '')
@@ -736,7 +873,16 @@ def analyze_batch_with_gemini(
     documents: list,
     extracted_texts: Dict[str, str],
 ) -> dict:
-    """Run cross-document analysis via Gemini and persist to BatchAnalysis."""
+    """Run cross-document analysis via Gemini and persist to BatchAnalysis.
+
+    Four prompts are issued sequentially:
+    1. **Combined summary** — a unified overview of all documents.
+    2. **Common themes** — recurring topics / themes shared across docs.
+    3. **Key insights** — the most important takeaways.
+    4. **Contradictions / differences** — conflicting statements or data.
+
+    Results are stored on the :model:`BatchAnalysis` row linked to *batch*.
+    """
     genai = _configure_genai()
 
     if not settings.GEMINI_API_KEY:
@@ -801,6 +947,7 @@ def analyze_batch_with_gemini(
 
             result = response.text.strip()
 
+            # Log the API call
             log_api_call(
                 analysis_type=f'batch_{analysis_type}', response=response,
                 elapsed=elapsed, success=True, batch=batch,
@@ -813,6 +960,8 @@ def analyze_batch_with_gemini(
                 analysis.key_insights = _parse_json_list_or_objects(result)
 
             elif analysis_type == 'key_insights':
+                # Merge with any themes already stored — keep both under
+                # key_insights as a unified list.
                 insights = _parse_json_list_or_objects(result)
                 existing = analysis.key_insights or []
                 if isinstance(existing, list):
@@ -823,11 +972,18 @@ def analyze_batch_with_gemini(
             elif analysis_type == 'contradictions':
                 analysis.contradictions = _parse_json_list_or_objects(result)
 
-            logger.info(f"Batch analysis — {analysis_type} completed in {elapsed:.2f}s")
+            logger.info(
+                f"Batch analysis — {analysis_type} completed in {elapsed:.2f}s"
+            )
+
+            # Respect Gemini free-tier rate limits (5 req/min)
             time.sleep(GEMINI_CALL_DELAY)
 
         except Exception as e:
-            logger.error(f"Batch analysis — error in {analysis_type}: {e}", exc_info=True)
+            logger.error(
+                f"Batch analysis — error in {analysis_type}: {e}",
+                exc_info=True,
+            )
             log_api_call(
                 analysis_type=f'batch_{analysis_type}', response=None,
                 elapsed=time.time() - start if 'start' in dir() else 0,
@@ -849,9 +1005,13 @@ def analyze_batch_with_gemini(
 
 
 def _parse_json_list_or_objects(text: str) -> list:
-    """Parse a Gemini response as a JSON list (of strings or objects)."""
+    """Parse a Gemini response as a JSON list (of strings or objects).
+
+    Falls back to ``_parse_json_list`` for plain bullet/numbered lists.
+    """
     cleaned = text.strip()
 
+    # Strip markdown fences
     if cleaned.startswith('```'):
         lines = cleaned.split('\n')
         lines = [ln for ln in lines if not ln.strip().startswith('```')]
@@ -864,59 +1024,5 @@ def _parse_json_list_or_objects(text: str) -> list:
     except (json.JSONDecodeError, ValueError):
         pass
 
+    # Fallback to the existing plain-text parser
     return _parse_json_list(text)
-
-# ── Periodic / Maintenance Tasks ─────────────────────────────────────────────
-
-@shared_task
-def cleanup_failed_jobs():
-    """Remove failed processing jobs older than 24 hours."""
-    cutoff = timezone.now() - timedelta(hours=24)
-    count, _ = ProcessingJob.objects.filter(
-        status='failure', created_at__lt=cutoff,
-    ).delete()
-    logger.info(f"Cleaned up {count} failed processing jobs")
-    return f"Cleaned up {count} failed jobs"
-
-
-@shared_task
-def cleanup_old_logs():
-    """Remove processing logs older than 7 days."""
-    cutoff = timezone.now() - timedelta(days=7)
-    count, _ = ProcessingLog.objects.filter(created_at__lt=cutoff).delete()
-    logger.info(f"Cleaned up {count} old processing logs")
-    return f"Cleaned up {count} old logs"
-
-
-@shared_task
-def retry_failed_documents():
-    """Retry recently-failed documents (excludes user-cancelled)."""
-    cutoff = timezone.now() - timedelta(hours=1)
-    recent_failures = (
-        Document.objects
-        .filter(status='failed', processing_started_at__gte=cutoff)
-        .exclude(processing_error__icontains='cancelled')
-        .select_related('processing_job')
-    )
-
-    retried = 0
-    for doc in recent_failures:
-        try:
-            job = getattr(doc, 'processing_job', None)
-            if job and job.retry_count < 3:
-                doc.status = 'uploaded'
-                doc.processing_error = None
-                doc.save(update_fields=['status', 'processing_error'])
-
-                job.retry_count += 1
-                job.status = 'retry'
-                job.save(update_fields=['retry_count', 'status'])
-
-                process_document.delay(str(doc.id))
-                retried += 1
-                logger.info(f"Retrying document {doc.id}")
-        except Exception as e:
-            logger.error(f"Error retrying document {doc.id}: {e}")
-
-    logger.info(f"Retried {retried} documents")
-    return f"Retried {retried} documents"

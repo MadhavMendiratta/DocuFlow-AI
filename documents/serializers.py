@@ -5,6 +5,7 @@ from .models import (
     DocumentAnalysis, DocumentTag, ProcessingLog, APILog,
 )
 
+
 class DocumentSerializer(serializers.ModelSerializer):
     """Serializer for Document model"""
     
@@ -197,17 +198,6 @@ class DocumentTagSerializer(serializers.ModelSerializer):
         return obj.documenttagging_set.count()
 
 
-class DocumentStatsSerializer(serializers.Serializer):
-    """Serializer for document statistics"""
-    
-    total_documents = serializers.IntegerField()
-    processing_documents = serializers.IntegerField()
-    completed_documents = serializers.IntegerField()
-    failed_documents = serializers.IntegerField()
-    total_file_size = serializers.IntegerField()
-    avg_processing_time = serializers.FloatField()
-    recent_uploads = serializers.IntegerField()
-
 class DocumentUploadSerializer(serializers.Serializer):
     """Serializer for document upload with processing options"""
     
@@ -265,6 +255,7 @@ class DocumentUploadSerializer(serializers.Serializer):
             process_document.delay(str(document.id))
         
         return document
+
 
 class BatchUploadSerializer(serializers.Serializer):
     """Serializer for uploading multiple files as a single batch."""
@@ -336,14 +327,21 @@ class BatchUploadSerializer(serializers.Serializer):
         # Mark the batch as processing and fire the Celery task
         batch.status = 'processing'
         batch.save(update_fields=['status'])
-        
-        # We will add process_batch in Commit 26, but the call is prepped here!
-        try:
-            process_batch.delay(str(batch.id))
-        except NameError:
-            pass
+        process_batch.delay(str(batch.id))
 
         return batch, documents
+
+
+class DocumentStatsSerializer(serializers.Serializer):
+    """Serializer for document statistics"""
+    
+    total_documents = serializers.IntegerField()
+    processing_documents = serializers.IntegerField()
+    completed_documents = serializers.IntegerField()
+    failed_documents = serializers.IntegerField()
+    total_file_size = serializers.IntegerField()
+    avg_processing_time = serializers.FloatField()
+    recent_uploads = serializers.IntegerField()
 
 
 class BatchDocumentStatusSerializer(serializers.ModelSerializer):
