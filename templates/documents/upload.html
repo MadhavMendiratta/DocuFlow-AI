@@ -1,0 +1,304 @@
+{% extends 'base.html' %}
+{% block title %}Upload Documents — AI Document Processor{% endblock %}
+
+{% block content %}
+<div class="px-4 sm:px-6 lg:px-8 py-6">
+
+    <!-- Header -->
+    <div class="mb-6">
+        <a href="{% url 'documents:batch_list' %}"
+           class="inline-flex items-center text-sm text-gray-500 hover:text-gray-700 mb-2">
+            <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+            </svg>
+            Back to Batches
+        </a>
+        <h1 class="text-2xl font-bold text-gray-900">Upload Documents</h1>
+        <p class="mt-1 text-sm text-gray-500">Upload one or more PDF, TXT, or DOCX files to analyse with AI.</p>
+    </div>
+
+    <div class="max-w-2xl">
+        <div class="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden">
+            <div class="p-6 space-y-6">
+
+                <!-- Batch Title -->
+                <div>
+                    <label for="batch-title" class="block text-sm font-medium text-gray-700 mb-1">
+                        Batch Title <span class="text-gray-400 font-normal">(optional)</span>
+                    </label>
+                    <input type="text" id="batch-title" placeholder="e.g. Q4 Financial Reports"
+                           class="block w-full rounded-lg border border-gray-300 px-3.5 py-2.5 text-sm
+                                  focus:border-primary-500 focus:ring-1 focus:ring-primary-500 outline-none transition">
+                </div>
+
+                <!-- Drop Zone -->
+                <div id="drop-zone"
+                     class="relative border-2 border-dashed border-gray-300 rounded-xl p-8 text-center cursor-pointer
+                            hover:border-primary-400 hover:bg-primary-50/30 transition-all"
+                     onclick="document.getElementById('file-input').click()">
+
+                    <input type="file" id="file-input" multiple accept=".pdf,.txt,.docx" class="hidden"
+                           onchange="handleFileSelect(this)">
+
+                    <div id="drop-placeholder">
+                        <div class="mx-auto w-14 h-14 rounded-full bg-gray-100 flex items-center justify-center mb-4">
+                            <svg class="w-7 h-7 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                                      d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/>
+                            </svg>
+                        </div>
+                        <p class="text-sm font-medium text-gray-700">Drag &amp; drop files here</p>
+                        <p class="mt-1 text-xs text-gray-500">or <span class="text-primary-600 font-medium">browse</span> to choose files</p>
+                        <p class="mt-3 text-xs text-gray-400">PDF, TXT, DOCX &mdash; Max 10 MB each &mdash; Multiple files supported</p>
+                    </div>
+                </div>
+
+                <!-- Selected Files List -->
+                <div id="file-list-section" class="hidden">
+                    <div class="flex items-center justify-between mb-2">
+                        <h3 class="text-sm font-medium text-gray-700">
+                            Selected Files (<span id="file-count">0</span>)
+                        </h3>
+                        <button type="button" onclick="clearAllFiles()"
+                                class="text-xs text-red-600 hover:text-red-800 font-medium">Clear all</button>
+                    </div>
+                    <div id="file-list" class="space-y-2 max-h-60 overflow-y-auto"></div>
+                    <div class="mt-2 flex items-center justify-between text-xs text-gray-400">
+                        <span>Total: <span id="total-size">0 B</span></span>
+                        <button type="button" onclick="document.getElementById('file-input').click()"
+                                class="text-primary-600 hover:text-primary-800 font-medium">+ Add more files</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Footer Actions -->
+            <div class="px-6 py-4 bg-gray-50 border-t border-gray-200 flex items-center justify-end gap-3">
+                <button type="button" onclick="clearAllFiles()"
+                        class="px-4 py-2 text-sm font-medium text-gray-700 hover:text-gray-900 transition-colors">
+                    Reset
+                </button>
+                <button type="button" id="submit-btn" onclick="startUpload()" disabled
+                        class="inline-flex items-center px-5 py-2.5 bg-primary-600 text-white text-sm font-medium rounded-lg
+                               hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm">
+                    <svg class="w-4 h-4 mr-2 -ml-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/>
+                    </svg>
+                    <span id="submit-text">Upload &amp; Process</span>
+                </button>
+            </div>
+        </div>
+
+        <!-- Upload Progress -->
+        <div id="progress-card" class="hidden mt-5 bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden">
+            <div class="p-5">
+                <div class="flex items-center justify-between text-sm mb-2">
+                    <span class="font-medium text-gray-700" id="progress-label">Uploading…</span>
+                    <span class="text-gray-400" id="progress-pct">0%</span>
+                </div>
+                <div class="w-full bg-gray-200 rounded-full h-2">
+                    <div id="progress-bar" class="bg-primary-500 h-2 rounded-full transition-all duration-300" style="width:0%"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Batch Created Success -->
+        <div id="success-card" class="hidden mt-5 bg-white rounded-xl border border-green-200 shadow-sm overflow-hidden">
+            <div class="p-5 flex items-start gap-4">
+                <div class="flex-shrink-0 w-10 h-10 rounded-full bg-green-100 flex items-center justify-center">
+                    <svg class="w-5 h-5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                    </svg>
+                </div>
+                <div class="flex-1 min-w-0">
+                    <h3 class="text-sm font-semibold text-green-800">Batch created successfully!</h3>
+                    <p class="mt-0.5 text-sm text-green-700" id="success-msg"></p>
+                    <a id="success-link" href="#"
+                       class="mt-2 inline-flex items-center text-sm font-medium text-primary-600 hover:text-primary-700">
+                        View batch details &rarr;
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+    let selectedFiles = [];
+
+    const dropZone      = document.getElementById('drop-zone');
+    const fileInput      = document.getElementById('file-input');
+    const fileListSection = document.getElementById('file-list-section');
+    const fileListEl     = document.getElementById('file-list');
+    const fileCountEl    = document.getElementById('file-count');
+    const totalSizeEl    = document.getElementById('total-size');
+    const submitBtn      = document.getElementById('submit-btn');
+
+    // ── Drag & Drop ─────────────────────────────────────────────────
+    dropZone.addEventListener('dragover', e => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'copy';
+        dropZone.classList.add('border-primary-500', 'bg-primary-50/50');
+    });
+    dropZone.addEventListener('dragleave', () => {
+        dropZone.classList.remove('border-primary-500', 'bg-primary-50/50');
+    });
+    dropZone.addEventListener('drop', e => {
+        e.preventDefault();
+        dropZone.classList.remove('border-primary-500', 'bg-primary-50/50');
+        addFiles(Array.from(e.dataTransfer.files));
+    });
+
+    function handleFileSelect(input) {
+        addFiles(Array.from(input.files));
+        input.value = '';  // allow re-selecting same files
+    }
+
+    // ── File Management ─────────────────────────────────────────────
+    const ALLOWED_EXTS = ['.pdf', '.txt', '.docx'];
+    const MAX_SIZE = 10 * 1024 * 1024;
+
+    function addFiles(files) {
+        for (const file of files) {
+            const ext = '.' + file.name.split('.').pop().toLowerCase();
+            if (!ALLOWED_EXTS.includes(ext)) {
+                showToast(`"${file.name}" is not a supported file type.`, 'error');
+                continue;
+            }
+            if (file.size > MAX_SIZE) {
+                showToast(`"${file.name}" exceeds 10 MB limit.`, 'error');
+                continue;
+            }
+            // Avoid duplicates by name+size
+            if (selectedFiles.some(f => f.name === file.name && f.size === file.size)) continue;
+            selectedFiles.push(file);
+        }
+        renderFileList();
+    }
+
+    function removeFile(index) {
+        selectedFiles.splice(index, 1);
+        renderFileList();
+    }
+
+    function clearAllFiles() {
+        selectedFiles = [];
+        renderFileList();
+        document.getElementById('batch-title').value = '';
+    }
+
+    function renderFileList() {
+        fileListEl.innerHTML = '';
+        if (selectedFiles.length === 0) {
+            fileListSection.classList.add('hidden');
+            submitBtn.disabled = true;
+            return;
+        }
+        fileListSection.classList.remove('hidden');
+        submitBtn.disabled = false;
+        fileCountEl.textContent = selectedFiles.length;
+
+        let total = 0;
+        selectedFiles.forEach((file, i) => {
+            total += file.size;
+            const ext = file.name.split('.').pop().toUpperCase();
+            const row = document.createElement('div');
+            row.className = 'flex items-center gap-3 px-3 py-2.5 bg-gray-50 rounded-lg border border-gray-100';
+            row.innerHTML = `
+                <div class="flex-shrink-0 w-8 h-8 rounded-lg bg-primary-50 text-primary-600 flex items-center justify-center">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                              d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                    </svg>
+                </div>
+                <div class="flex-1 min-w-0">
+                    <p class="text-sm font-medium text-gray-900 truncate">${file.name}</p>
+                    <p class="text-xs text-gray-400">${ext} · ${formatBytes(file.size)}</p>
+                </div>
+                <button type="button" onclick="removeFile(${i})"
+                        class="flex-shrink-0 w-7 h-7 rounded-full hover:bg-red-50 flex items-center justify-center text-gray-400 hover:text-red-500 transition-colors">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                    </svg>
+                </button>`;
+            fileListEl.appendChild(row);
+        });
+        totalSizeEl.textContent = formatBytes(total);
+    }
+
+    // ── Upload ──────────────────────────────────────────────────────
+    function startUpload() {
+        if (!selectedFiles.length) {
+            showToast('Please select at least one file.', 'warning');
+            return;
+        }
+
+        const formData = new FormData();
+        const title = document.getElementById('batch-title').value.trim();
+        if (title) formData.append('title', title);
+        selectedFiles.forEach(f => formData.append('files', f));
+
+        submitBtn.disabled = true;
+        document.getElementById('submit-text').textContent = 'Uploading…';
+        document.getElementById('progress-card').classList.remove('hidden');
+        document.getElementById('success-card').classList.add('hidden');
+
+        const xhr = new XMLHttpRequest();
+
+        xhr.upload.addEventListener('progress', e => {
+            if (e.lengthComputable) {
+                const pct = Math.round((e.loaded / e.total) * 100);
+                document.getElementById('progress-bar').style.width = pct + '%';
+                document.getElementById('progress-pct').textContent = pct + '%';
+                document.getElementById('progress-label').textContent = pct < 100 ? 'Uploading…' : 'Creating batch…';
+            }
+        });
+
+        xhr.addEventListener('load', () => {
+            try {
+                const data = JSON.parse(xhr.responseText);
+                if (xhr.status === 201 && data.batch_id) {
+                    // Success
+                    document.getElementById('progress-label').textContent = 'Upload complete!';
+                    document.getElementById('progress-pct').textContent = '100%';
+                    document.getElementById('progress-bar').style.width = '100%';
+
+                    const successCard = document.getElementById('success-card');
+                    document.getElementById('success-msg').textContent =
+                        `${data.files_uploaded} file(s) uploaded. Processing has started.`;
+                    document.getElementById('success-link').href = '/batches/' + data.batch_id + '/';
+                    successCard.classList.remove('hidden');
+
+                    showToast(data.message || 'Batch created!', 'success');
+                    setTimeout(() => {
+                        window.location.href = '/batches/' + data.batch_id + '/';
+                    }, 1500);
+                } else {
+                    const msg = data.files?.[0] || data.error || data.detail || 'Upload failed.';
+                    showToast(msg, 'error');
+                    resetUploadUI();
+                }
+            } catch {
+                showToast('Unexpected server response.', 'error');
+                resetUploadUI();
+            }
+        });
+
+        xhr.addEventListener('error', () => {
+            showToast('Network error. Please try again.', 'error');
+            resetUploadUI();
+        });
+
+        xhr.open('POST', '/api/batch/upload/');
+        xhr.setRequestHeader('X-CSRFToken', getCookie('csrftoken'));
+        xhr.send(formData);
+    }
+
+    function resetUploadUI() {
+        submitBtn.disabled = selectedFiles.length === 0;
+        document.getElementById('submit-text').textContent = 'Upload & Process';
+        document.getElementById('progress-card').classList.add('hidden');
+    }
+</script>
+{% endblock %}
